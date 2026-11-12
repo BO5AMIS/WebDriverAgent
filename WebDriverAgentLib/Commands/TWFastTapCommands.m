@@ -7,7 +7,14 @@
  *   wait        NO (default): answer as soon as the event is queued for synthesis.
  *               YES: answer once XCTest's daemon has synthesized it (the touch has been played).
  *   orientation the UIInterfaceOrientation the point is expressed in (default portrait, 1)
- * GET /wda/tw/version -> {"tapwright": 1}, so a client can tell whether this route exists.
+ * POST /session/:sessionId/wda/tw/drag {points: [[t_ms, x, y], ...], orientation?}
+ *   points      the finger's path, at least two points: it presses at the first point at its time, moves
+ *               through each later point at its time (XCTest moves it in a straight line between them), and
+ *               lifts at the last point's time. A last point where the finger already is makes it rest there
+ *               before it lifts. Times are milliseconds from the press, in order, at most 60 s in all.
+ *   orientation as for tap
+ *   The answer comes once the whole drag has been played: {"ms": <synthesis ms>}.
+ * GET /wda/tw/version -> {"tapwright": 2} (1: tap only; 2: tap and drag), so a client can tell which routes exist.
  *
  * Unlike /wda/tap and /actions, nothing here reads the application: no element lookup, no
  * snapshot, no interface orientation query and no idle or quiescence wait. One touch path is
@@ -15,6 +22,9 @@
  * appium-ios PR #87), so the main thread, which serves every other route, is never blocked by it
  * and consecutive touches reach the daemon in the order they were asked for. The caller confirms
  * the effect by reading the screen afterwards.
+ *
+ * A drag is played the same way: one touch path, on the same queue, so a drag and the touches around it never
+ * overlap.
  *
  * Kept in this one file so the fork rebases cleanly onto upstream.
  */
@@ -39,6 +49,7 @@ static const NSTimeInterval TWDefaultHold = 0.05;
 static const NSTimeInterval TWMaxHold = 60.0;
 static const NSTimeInterval TWSynthesisSlack = 10.0; // seconds a synthesis may take beyond the touch itself
 static const int TWMaxPending = 8; // touches queued and not yet played before new ones are refused
+static const NSUInteger TWMaxDragPoints = 1000;
 
 static atomic_int twPending;
 
@@ -54,6 +65,7 @@ static atomic_int twPending;
     [[FBRoute GET:@"/wda/tw/version"].withoutSession respondWithTarget:self action:@selector(handleVersion:)],
     [[FBRoute GET:@"/wda/tw/version"] respondWithTarget:self action:@selector(handleVersion:)],
     [[FBRoute POST:@"/wda/tw/tap"] respondWithTarget:self action:@selector(handleTap:)],
+    [[FBRoute POST:@"/wda/tw/drag"] respondWithTarget:self action:@selector(handleDrag:)],
   ];
 }
 
@@ -71,7 +83,7 @@ static atomic_int twPending;
 
 + (id<FBResponsePayload>)handleVersion:(FBRouteRequest *)request
 {
-  return FBResponseWithObject(@{@"tapwright": @1});
+  return FBResponseWithObject(@{@"tapwright": @2});
 }
 
 + (NSNumber *)finiteNumber:(id)value
@@ -81,6 +93,23 @@ static atomic_int twPending;
   }
   double number = [(NSNumber *)value doubleValue];
   return isfinite(number) ? (NSNumber *)value : nil;
+}
+
+/** The request's orientation into `orientation` (portrait when absent); NO when it isn't 1-4. */
++ (BOOL)orientation:(UIInterfaceOrientation *)orientation from:(FBRouteRequest *)request
+{
+  *orientation = UIInterfaceOrientationPortrait;
+  id orientationValue = request.arguments[@"orientation"];
+  if (nil == orientationValue) {
+    return YES;
+  }
+  NSNumber *number = [self finiteNumber:orientationValue];
+  NSInteger value = number.integerValue;
+  if (nil == number || value < UIInterfaceOrientationPortrait || value > UIInterfaceOrientationLandscapeRight) {
+    return NO;
+  }
+  *orientation = (UIInterfaceOrientation)value;
+  return YES;
 }
 
 + (XCSynthesizedEventRecord *)eventAtPoint:(CGPoint)point
@@ -113,29 +142,96 @@ static atomic_int twPending;
     }
     hold = number.doubleValue;
   }
-  UIInterfaceOrientation orientation = UIInterfaceOrientationPortrait;
-  id orientationValue = request.arguments[@"orientation"];
-  if (nil != orientationValue) {
-    NSNumber *number = [self finiteNumber:orientationValue];
-    NSInteger value = number.integerValue;
-    if (nil == number || value < UIInterfaceOrientationPortrait || value > UIInterfaceOrientationLandscapeRight) {
-      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"orientation must be 1-4 (UIInterfaceOrientation)"
-                                                                         traceback:nil]);
-    }
-    orientation = (UIInterfaceOrientation)value;
+  UIInterfaceOrientation orientation;
+  if (![self orientation:&orientation from:request]) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"orientation must be 1-4 (UIInterfaceOrientation)"
+                                                                       traceback:nil]);
   }
   BOOL wait = [request.arguments[@"wait"] respondsToSelector:@selector(boolValue)]
     && [request.arguments[@"wait"] boolValue];
 
+  XCSynthesizedEventRecord *event = [self eventAtPoint:CGPointMake(x.doubleValue, y.doubleValue)
+                                                  hold:hold
+                                           orientation:orientation];
+  return [self play:event
+              limit:hold + TWSynthesisSlack
+               wait:wait
+               what:[NSString stringWithFormat:@"tap at (%@, %@)", x, y]];
+}
+
++ (id<FBResponsePayload>)handleDrag:(FBRouteRequest *)request
+{
+  id points = request.arguments[@"points"];
+  if (![points isKindOfClass:NSArray.class] || [(NSArray *)points count] < 2
+      || [(NSArray *)points count] > TWMaxDragPoints) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"points must be a list of 2-1000 [t_ms, x, y]"
+                                                                       traceback:nil]);
+  }
+  UIInterfaceOrientation orientation;
+  if (![self orientation:&orientation from:request]) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"orientation must be 1-4 (UIInterfaceOrientation)"
+                                                                       traceback:nil]);
+  }
+  NSArray *list = (NSArray *)points;
+  NSUInteger count = list.count;
+  NSMutableArray<NSNumber *> *times = [NSMutableArray arrayWithCapacity:count];
+  NSMutableArray<NSValue *> *where = [NSMutableArray arrayWithCapacity:count];
+  for (NSUInteger i = 0; i < count; i++) {
+    id point = [list objectAtIndex:i];
+    NSNumber *t = nil;
+    NSNumber *x = nil;
+    NSNumber *y = nil;
+    if ([point isKindOfClass:NSArray.class] && 3 == [(NSArray *)point count]) {
+      t = [self finiteNumber:[(NSArray *)point objectAtIndex:0]];
+      x = [self finiteNumber:[(NSArray *)point objectAtIndex:1]];
+      y = [self finiteNumber:[(NSArray *)point objectAtIndex:2]];
+    }
+    if (nil == t || nil == x || nil == y) {
+      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"each point must be [t_ms, x, y], finite numbers"
+                                                                         traceback:nil]);
+    }
+    double seconds = t.doubleValue / 1000.0;
+    if (seconds < 0 || seconds > TWMaxHold || (i > 0 && seconds < times[i - 1].doubleValue)) {
+      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"point times must be in order, 0-60000 ms"
+                                                                         traceback:nil]);
+    }
+    [times addObject:@(seconds)];
+    [where addObject:[NSValue valueWithCGPoint:CGPointMake(x.doubleValue, y.doubleValue)]];
+  }
+  XCPointerEventPath *path = [[XCPointerEventPath alloc] initForTouchAtPoint:where[0].CGPointValue
+                                                                      offset:times[0].doubleValue];
+  for (NSUInteger i = 1; i < count; i++) {
+    // a last point where the finger already is: it rests there until it lifts (no move, as with W3C's pause)
+    BOOL rests = (i == count - 1) && CGPointEqualToPoint(where[i].CGPointValue, where[i - 1].CGPointValue);
+    if (!rests) {
+      [path moveToPoint:where[i].CGPointValue atOffset:times[i].doubleValue];
+    }
+  }
+  NSTimeInterval end = times[count - 1].doubleValue;
+  [path liftUpAtOffset:end];
+  XCSynthesizedEventRecord *event = [[XCSynthesizedEventRecord alloc] initWithName:@"Tapwright drag"
+                                                              interfaceOrientation:orientation];
+  [event addPointerEventPath:path];
+  return [self play:event
+              limit:end + TWSynthesisSlack
+               wait:YES
+               what:[NSString stringWithFormat:@"drag of %lu points", (unsigned long)count]];
+}
+
+/**
+ * Plays the event on the synthesis queue. Without `wait` it answers once the event is queued; with it, once XCTest
+ * has played it ({"ms": <synthesis ms>}) or failed to. At most TWMaxPending events wait at once.
+ */
++ (id<FBResponsePayload>)play:(XCSynthesizedEventRecord *)event
+                        limit:(NSTimeInterval)limit
+                         wait:(BOOL)wait
+                         what:(NSString *)what
+{
   if (atomic_fetch_add(&twPending, 1) >= TWMaxPending) {
     atomic_fetch_sub(&twPending, 1);
     return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"too many touches are still being played; try again"
                                                                traceback:nil]);
   }
-  XCSynthesizedEventRecord *event = [self eventAtPoint:CGPointMake(x.doubleValue, y.doubleValue)
-                                                  hold:hold
-                                           orientation:orientation];
-  NSTimeInterval limit = hold + TWSynthesisSlack;
   // `failure` and `playedMs` are written by the queue before it signals `played`, and read by
   // the main thread only after that.
   dispatch_semaphore_t played = dispatch_semaphore_create(0);
@@ -160,7 +256,7 @@ static atomic_int twPending;
       failure = synthesisError.localizedDescription ?: @"XCTest could not play the touch";
     }
     if (nil != failure) {
-      [FBLogger logFmt:@"Tapwright tap at (%@, %@): %@", x, y, failure];
+      [FBLogger logFmt:@"Tapwright %@: %@", what, failure];
     }
     atomic_fetch_sub(&twPending, 1);
     dispatch_semaphore_signal(played);
