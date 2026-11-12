@@ -36,6 +36,9 @@
 #if !TARGET_OS_TV && !TARGET_OS_WATCH
 
 static const NSUInteger TWMaxPictures = 20;
+static const unsigned long long TWMaxBytes = 40ULL * 1024 * 1024; // all pictures of one call together (the computer caps it too)
+// PHAuthorizationStatusLimited (iOS 14); written as its number so the file builds with an older deployment target
+static const NSInteger TWStatusLimited = 4;
 static const NSTimeInterval TWPhotosPromptWait = 120.0; // seconds a person has to answer iOS's prompt
 static const NSTimeInterval TWPhotosChangeWait = 120.0; // seconds a change may take (a delete waits for the person's confirm)
 
@@ -59,21 +62,20 @@ static const NSTimeInterval TWPhotosChangeWait = 120.0; // seconds a change may 
   switch (status) {
     case PHAuthorizationStatusAuthorized:
       return @"authorized";
-    case PHAuthorizationStatusLimited:
-      return @"limited";
     case PHAuthorizationStatusDenied:
       return @"denied";
     case PHAuthorizationStatusRestricted:
       return @"restricted";
     case PHAuthorizationStatusNotDetermined:
-    default:
       return @"notDetermined";
+    default:
+      return TWStatusLimited == (NSInteger)status ? @"limited" : @"notDetermined";
   }
 }
 
 + (BOOL)allows:(PHAuthorizationStatus)status
 {
-  return PHAuthorizationStatusAuthorized == status || PHAuthorizationStatusLimited == status;
+  return PHAuthorizationStatusAuthorized == status || TWStatusLimited == (NSInteger)status;
 }
 
 /** Spins the main run loop until `done` is signalled or `limit` seconds pass; YES when it was signalled. */
@@ -88,19 +90,32 @@ static const NSTimeInterval TWPhotosChangeWait = 120.0; // seconds a change may 
   } error:&spinError];
 }
 
-/** The access level's status; when iOS hasn't been asked, asks (the person answers on the phone) and waits. */
-+ (PHAuthorizationStatus)statusFor:(PHAccessLevel)level askIfNeeded:(BOOL)ask
+/**
+ * The access level's status (`full`: read and write; else add-only); when iOS hasn't been asked, asks (the person
+ * answers on the phone) and waits. The access levels exist from iOS 14; before that there is one status for both.
+ */
++ (PHAuthorizationStatus)statusForFullAccess:(BOOL)full askIfNeeded:(BOOL)ask
 {
-  PHAuthorizationStatus status = [PHPhotoLibrary authorizationStatusForAccessLevel:level];
+  PHAuthorizationStatus status;
+  if (@available(iOS 14.0, *)) {
+    status = [PHPhotoLibrary authorizationStatusForAccessLevel:full ? PHAccessLevelReadWrite : PHAccessLevelAddOnly];
+  } else {
+    status = [PHPhotoLibrary authorizationStatus];
+  }
   if (PHAuthorizationStatusNotDetermined != status || !ask) {
     return status;
   }
   dispatch_semaphore_t answered = dispatch_semaphore_create(0);
   __block PHAuthorizationStatus granted = PHAuthorizationStatusNotDetermined;
-  [PHPhotoLibrary requestAuthorizationForAccessLevel:level handler:^(PHAuthorizationStatus newStatus) {
+  void (^handler)(PHAuthorizationStatus) = ^(PHAuthorizationStatus newStatus) {
     granted = newStatus;
     dispatch_semaphore_signal(answered);
-  }];
+  };
+  if (@available(iOS 14.0, *)) {
+    [PHPhotoLibrary requestAuthorizationForAccessLevel:full ? PHAccessLevelReadWrite : PHAccessLevelAddOnly handler:handler];
+  } else {
+    [PHPhotoLibrary requestAuthorization:handler];
+  }
   if (![self waitFor:answered limit:TWPhotosPromptWait]) {
     [FBLogger logFmt:@"Tapwright photos: nobody answered iOS's photo library prompt within %.0f s", TWPhotosPromptWait];
     return PHAuthorizationStatusNotDetermined;
@@ -111,8 +126,8 @@ static const NSTimeInterval TWPhotosChangeWait = 120.0; // seconds a change may 
 + (id<FBResponsePayload>)handleAccess:(FBRouteRequest *)request
 {
   return FBResponseWithObject(@{
-    @"add": [self nameOfStatus:[self statusFor:PHAccessLevelAddOnly askIfNeeded:NO]],
-    @"full": [self nameOfStatus:[self statusFor:PHAccessLevelReadWrite askIfNeeded:NO]],
+    @"add": [self nameOfStatus:[self statusForFullAccess:NO askIfNeeded:NO]],
+    @"full": [self nameOfStatus:[self statusForFullAccess:YES askIfNeeded:NO]],
   });
 }
 
@@ -132,7 +147,16 @@ static const NSTimeInterval TWPhotosChangeWait = 120.0; // seconds a change may 
                                                                        traceback:nil]);
   }
   NSMutableArray<NSData *> *pictures = [NSMutableArray arrayWithCapacity:list.count];
+  unsigned long long total = 0;
   for (id item in list) {
+    // a base64 string is a third bigger than its bytes: refuse before decoding what is over the cap
+    if ([item isKindOfClass:NSString.class]) {
+      total += (unsigned long long)([(NSString *)item length] / 4 * 3);
+      if (total > TWMaxBytes) {
+        return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"the pictures together are over the 40 MB limit"
+                                                                           traceback:nil]);
+      }
+    }
     NSData *data = [item isKindOfClass:NSString.class]
       ? [[NSData alloc] initWithBase64EncodedString:item options:NSDataBase64DecodingIgnoreUnknownCharacters]
       : nil;
@@ -143,7 +167,7 @@ static const NSTimeInterval TWPhotosChangeWait = 120.0; // seconds a change may 
     [pictures addObject:data];
   }
 
-  PHAuthorizationStatus status = [self statusFor:PHAccessLevelAddOnly askIfNeeded:YES];
+  PHAuthorizationStatus status = [self statusForFullAccess:NO askIfNeeded:YES];
   if (![self allows:status]) {
     NSString *message = [NSString stringWithFormat:@"the runner may not add to the photo library (iOS says %@)",
                          [self nameOfStatus:status]];
@@ -195,7 +219,7 @@ static const NSTimeInterval TWPhotosChangeWait = 120.0; // seconds a change may 
                                                                          traceback:nil]);
     }
   }
-  PHAuthorizationStatus status = [self statusFor:PHAccessLevelReadWrite askIfNeeded:YES];
+  PHAuthorizationStatus status = [self statusForFullAccess:YES askIfNeeded:YES];
   if (![self allows:status]) {
     NSString *message = [NSString stringWithFormat:@"full access to the photo library is needed to delete pictures (iOS says %@)",
                          [self nameOfStatus:status]];
