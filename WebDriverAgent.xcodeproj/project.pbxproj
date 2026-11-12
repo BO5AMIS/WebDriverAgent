@@ -1086,6 +1086,7 @@
 		EE158ABC1CBD456F00A3E3F0 /* FBDebugCommands.h in Headers */ = {isa = PBXBuildFile; fileRef = EE9AB7541CAEDF0C008C271F /* FBDebugCommands.h */; };
 		EE158ABD1CBD456F00A3E3F0 /* FBDebugCommands.m in Sources */ = {isa = PBXBuildFile; fileRef = EE9AB7551CAEDF0C008C271F /* FBDebugCommands.m */; };
 		7A1F0E0000000000000000A2 /* TWFastTapCommands.m in Sources */ = {isa = PBXBuildFile; fileRef = 7A1F0E0000000000000000A1 /* TWFastTapCommands.m */; };
+		7A1F0E0000000000000000B2 /* TWPhotosCommands.m in Sources */ = {isa = PBXBuildFile; fileRef = 7A1F0E0000000000000000B1 /* TWPhotosCommands.m */; };
 		EE158ABE1CBD456F00A3E3F0 /* FBElementCommands.h in Headers */ = {isa = PBXBuildFile; fileRef = EE9AB7561CAEDF0C008C271F /* FBElementCommands.h */; };
 		EE158ABF1CBD456F00A3E3F0 /* FBElementCommands.m in Sources */ = {isa = PBXBuildFile; fileRef = EE9AB7571CAEDF0C008C271F /* FBElementCommands.m */; };
 		EE158AC01CBD456F00A3E3F0 /* FBFindElementCommands.h in Headers */ = {isa = PBXBuildFile; fileRef = EE9AB7581CAEDF0C008C271F /* FBFindElementCommands.h */; };
@@ -1918,6 +1919,7 @@
 		EE9AB7541CAEDF0C008C271F /* FBDebugCommands.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = FBDebugCommands.h; sourceTree = "<group>"; };
 		EE9AB7551CAEDF0C008C271F /* FBDebugCommands.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = FBDebugCommands.m; sourceTree = "<group>"; };
 		7A1F0E0000000000000000A1 /* TWFastTapCommands.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = TWFastTapCommands.m; sourceTree = "<group>"; };
+		7A1F0E0000000000000000B1 /* TWPhotosCommands.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = TWPhotosCommands.m; sourceTree = "<group>"; };
 		EE9AB7561CAEDF0C008C271F /* FBElementCommands.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = FBElementCommands.h; sourceTree = "<group>"; };
 		EE9AB7571CAEDF0C008C271F /* FBElementCommands.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = FBElementCommands.m; sourceTree = "<group>"; };
 		EE9AB7581CAEDF0C008C271F /* FBFindElementCommands.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = FBFindElementCommands.h; sourceTree = "<group>"; };
@@ -2489,6 +2491,7 @@
 				EE9AB7541CAEDF0C008C271F /* FBDebugCommands.h */,
 				EE9AB7551CAEDF0C008C271F /* FBDebugCommands.m */,
 				7A1F0E0000000000000000A1 /* TWFastTapCommands.m */,
+				7A1F0E0000000000000000B1 /* TWPhotosCommands.m */,
 				EE9AB7561CAEDF0C008C271F /* FBElementCommands.h */,
 				EE9AB7571CAEDF0C008C271F /* FBElementCommands.m */,
 				EE9AB7581CAEDF0C008C271F /* FBFindElementCommands.h */,
@@ -4739,6 +4742,7 @@
 			files = (
 				EE158AC71CBD456F00A3E3F0 /* FBScreenshotCommands.m in Sources */,
 				7A1F0E0000000000000000A2 /* TWFastTapCommands.m in Sources */,
+				7A1F0E0000000000000000B2 /* TWPhotosCommands.m in Sources */,
 				7136A47A1E8918E60024FC3D /* XCUIElement+FBPickerWheel.m in Sources */,
 				6385F4A7220A40760095BBDB /* XCUIApplicationProcessDelay.m in Sources */,
 				71A5C67529A4F39600421C37 /* XCTIssue+FBPatcher.m in Sources */,
