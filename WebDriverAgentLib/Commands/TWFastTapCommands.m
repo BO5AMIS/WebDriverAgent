@@ -1,12 +1,17 @@
 /**
  * Tapwright: a fast touch at a screen point.
  *
- * POST /session/:sessionId/wda/tw/tap {x, y, duration?, wait?, orientation?}
+ * POST /session/:sessionId/wda/tw/tap {x, y, duration?, wait?, orientation?, apps?}
  *   x, y        the point, in screen points (portrait unless `orientation` says otherwise)
  *   duration    seconds the finger rests before it lifts (default 0.05; a long press passes more)
  *   wait        NO (default): answer as soon as the event is queued for synthesis.
  *               YES: answer once XCTest's daemon has synthesized it (the touch has been played).
  *   orientation the UIInterfaceOrientation the point is expressed in (default portrait, 1)
+ *   apps        (version 4) bundle ids: the touch is made only while one of these apps is in front, as
+ *               GET /wda/activeAppInfo names it, asked just before the touch is queued. Otherwise nothing is touched
+ *               and the answer is an "invalid element state" error whose message starts "tapwright front:" and names
+ *               the app in front ("unknown" when it can't be told), so the client can ask its own way. It is also
+ *               refused that way while another touch is still being played (the check would not be the touch's).
  * POST /session/:sessionId/wda/tw/drag {points: [[t_ms, x, y], ...], orientation?}
  *   points      the finger's path, at least two points: it presses at the first point at its time, moves
  *               through each later point at its time (XCTest moves it in a straight line between them), and
@@ -14,8 +19,9 @@
  *               before it lifts. Times are milliseconds from the press, in order, at most 60 s in all.
  *   orientation as for tap
  *   The answer comes once the whole drag has been played: {"ms": <synthesis ms>}.
- * GET /wda/tw/version -> {"tapwright": 3} (1: tap only; 2: tap and drag; 3: and the photo routes of
- * TWPhotosCommands.m), so a client can tell which routes exist.
+ * GET /wda/tw/version -> {"tapwright": 4} (1: tap only; 2: tap and drag; 3: and the photo routes of
+ * TWPhotosCommands.m; 4: and the compact tree read of TWTreeCommands.m, and the tap's `apps`), so a client can tell
+ * which routes exist.
  *
  * Unlike /wda/tap and /actions, nothing here reads the application: no element lookup, no
  * snapshot, no interface orientation query and no idle or quiescence wait. One touch path is
@@ -40,8 +46,11 @@
 #import "FBRoute.h"
 #import "FBRouteRequest.h"
 #import "FBRunLoopSpinner.h"
+#import "FBSession.h"
 #import "XCPointerEventPath.h"
 #import "XCSynthesizedEventRecord.h"
+#import "XCUIApplication.h"
+#import "XCUIApplication+FBHelpers.h"
 #import "XCUIDevice.h"
 
 #if !TARGET_OS_TV && !TARGET_OS_WATCH
@@ -84,7 +93,7 @@ static atomic_int twPending;
 
 + (id<FBResponsePayload>)handleVersion:(FBRouteRequest *)request
 {
-  return FBResponseWithObject(@{@"tapwright": @3});
+  return FBResponseWithObject(@{@"tapwright": @4});
 }
 
 + (NSNumber *)finiteNumber:(id)value
@@ -150,6 +159,17 @@ static atomic_int twPending;
   }
   BOOL wait = [request.arguments[@"wait"] respondsToSelector:@selector(boolValue)]
     && [request.arguments[@"wait"] boolValue];
+  id apps = request.arguments[@"apps"];
+  if (nil != apps) {
+    if (![self isListOfStrings:apps]) {
+      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"apps must be a list of bundle ids"
+                                                                         traceback:nil]);
+    }
+    NSString *refusal = [self refusalFor:request apps:(NSArray<NSString *> *)apps];
+    if (nil != refusal) {
+      return FBResponseWithStatus([FBCommandStatus invalidElementStateErrorWithMessage:refusal traceback:nil]);
+    }
+  }
 
   XCSynthesizedEventRecord *event = [self eventAtPoint:CGPointMake(x.doubleValue, y.doubleValue)
                                                   hold:hold
@@ -158,6 +178,43 @@ static atomic_int twPending;
               limit:hold + TWSynthesisSlack
                wait:wait
                what:[NSString stringWithFormat:@"tap at (%@, %@)", x, y]];
+}
+
++ (BOOL)isListOfStrings:(id)value
+{
+  if (![value isKindOfClass:NSArray.class] || 0 == [(NSArray *)value count]) {
+    return NO;
+  }
+  for (id item in (NSArray *)value) {
+    if (![item isKindOfClass:NSString.class] || 0 == [(NSString *)item length]) {
+      return NO;
+    }
+  }
+  return YES;
+}
+
+/**
+ * Why a touch for `apps` must not be made now, or nil when one of them is in front. The app in front is the one
+ * GET /wda/activeAppInfo names. Anything that can't be told (an error, no bundle id) refuses: nothing is touched on doubt.
+ */
++ (nullable NSString *)refusalFor:(FBRouteRequest *)request apps:(NSArray<NSString *> *)apps
+{
+  if (atomic_load(&twPending) > 0) {
+    return @"tapwright front: unknown is in front (another touch is still being played); nothing was touched";
+  }
+  NSString *front = nil;
+  @try {
+    XCUIApplication *app = request.session.activeApplication ?: XCUIApplication.fb_activeApplication;
+    front = app.bundleID;
+  } @catch (NSException *e) {
+    [FBLogger logFmt:@"Tapwright tap: the app in front can't be told: %@", e.reason];
+    front = nil;
+  }
+  if (front.length > 0 && [apps containsObject:(NSString *)front]) {
+    return nil;
+  }
+  return [NSString stringWithFormat:@"tapwright front: %@ is in front, not one of the given apps; nothing was touched",
+          front.length > 0 ? front : @"unknown"];
 }
 
 + (id<FBResponsePayload>)handleDrag:(FBRouteRequest *)request

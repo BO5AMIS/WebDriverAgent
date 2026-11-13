@@ -45,4 +45,4 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" WebDriverAgentRunner-Runner.zip \
             --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
-            --notes "Tapwright build of WebDriverAgent: appium/WebDriverAgent v16.15.3 plus Tapwright's routes (see WebDriverAgentLib/Commands/TWFastTapCommands.m)."
+            --notes "Tapwright build of WebDriverAgent: appium/WebDriverAgent v16.15.3 plus Tapwright's routes (see WebDriverAgentLib/Commands/TW*.m)."
