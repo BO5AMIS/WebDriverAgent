@@ -1,10 +1,10 @@
 /**
  * Tapwright: a compact read of the screen (route version 4).
  *
- * GET /session/:sessionId/wda/tw/tree?since=<token>   (and GET /wda/tw/tree without a session, as /source)
- *   The tree that GET /source?format=xml&excluded_attributes=visible,accessible gives, read the same way (the same
- *   application, the same idle wait, the same snapshot and the same attribute values), with only what Tapwright's
- *   list reads, as compact JSON:
+ * GET /wda/tw/tree?since=<token>   (and GET /session/:sessionId/wda/tw/tree)
+ *   The tree that GET /source?format=xml&excluded_attributes=visible,accessible gives on the same path, read the same
+ *   way (the same application, the same idle wait, the same snapshot and the same attribute values), with only what
+ *   Tapwright's list reads, as compact JSON:
  *     {"token": "<32 hex digits>", "tree": <node>, "ms": {"wait": n, "snapshot": n, "build": n}}
  *   A node is {"t": the element type without "XCUIElementType", "v": value, "n": name, "l": label,
  *              "p": placeholderValue, "tr": traits, "r": [x, y, width, height], "d": 1 when it is not enabled,

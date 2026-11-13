@@ -8,10 +8,11 @@
  *               YES: answer once XCTest's daemon has synthesized it (the touch has been played).
  *   orientation the UIInterfaceOrientation the point is expressed in (default portrait, 1)
  *   apps        (version 4) bundle ids: the touch is made only while one of these apps is in front, as
- *               GET /wda/activeAppInfo names it, asked just before the touch is queued. Otherwise nothing is touched
- *               and the answer is an "invalid element state" error whose message starts "tapwright front:" and names
- *               the app in front ("unknown" when it can't be told), so the client can ask its own way. It is also
- *               refused that way while another touch is still being played (the check would not be the touch's).
+ *               GET /wda/activeAppInfo (without a session) names it, asked just before the touch is queued.
+ *               Otherwise nothing is touched and the answer is an "invalid element state" error whose message
+ *               starts "tapwright front:" and names the app in front ("unknown" when it can't be told), so the client
+ *               can ask its own way. It is also refused that way while another touch is still being played (the
+ *               check would not be the touch's).
  * POST /session/:sessionId/wda/tw/drag {points: [[t_ms, x, y], ...], orientation?}
  *   points      the finger's path, at least two points: it presses at the first point at its time, moves
  *               through each later point at its time (XCTest moves it in a straight line between them), and
@@ -46,7 +47,6 @@
 #import "FBRoute.h"
 #import "FBRouteRequest.h"
 #import "FBRunLoopSpinner.h"
-#import "FBSession.h"
 #import "XCPointerEventPath.h"
 #import "XCSynthesizedEventRecord.h"
 #import "XCUIApplication.h"
@@ -165,7 +165,7 @@ static atomic_int twPending;
       return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"apps must be a list of bundle ids"
                                                                          traceback:nil]);
     }
-    NSString *refusal = [self refusalFor:request apps:(NSArray<NSString *> *)apps];
+    NSString *refusal = [self refusalFor:(NSArray<NSString *> *)apps];
     if (nil != refusal) {
       return FBResponseWithStatus([FBCommandStatus invalidElementStateErrorWithMessage:refusal traceback:nil]);
     }
@@ -195,17 +195,17 @@ static atomic_int twPending;
 
 /**
  * Why a touch for `apps` must not be made now, or nil when one of them is in front. The app in front is the one
- * GET /wda/activeAppInfo names. Anything that can't be told (an error, no bundle id) refuses: nothing is touched on doubt.
+ * GET /wda/activeAppInfo names when it is asked without a session, as Tapwright asks it (FBCustomCommands.m).
+ * Anything that can't be told (an error, no bundle id) refuses: nothing is touched on doubt.
  */
-+ (nullable NSString *)refusalFor:(FBRouteRequest *)request apps:(NSArray<NSString *> *)apps
++ (nullable NSString *)refusalFor:(NSArray<NSString *> *)apps
 {
   if (atomic_load(&twPending) > 0) {
     return @"tapwright front: unknown is in front (another touch is still being played); nothing was touched";
   }
   NSString *front = nil;
   @try {
-    XCUIApplication *app = request.session.activeApplication ?: XCUIApplication.fb_activeApplication;
-    front = app.bundleID;
+    front = XCUIApplication.fb_activeApplication.bundleID;
   } @catch (NSException *e) {
     [FBLogger logFmt:@"Tapwright tap: the app in front can't be told: %@", e.reason];
     front = nil;
