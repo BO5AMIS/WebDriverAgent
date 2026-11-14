@@ -8,7 +8,8 @@
  *     {"token": "<32 hex digits>", "tree": <node>, "ms": {"wait": n, "snapshot": n, "build": n}}
  *   A node is {"t": the element type without "XCUIElementType", "v": value, "n": name, "l": label,
  *              "p": placeholderValue, "tr": traits, "r": [x, y, width, height], "d": 1 when it is not enabled,
- *              "c": [its children's nodes], and on an application "pid": its process id and "b": its bundle id}.
+ *              "c": [its children's nodes], and on an application "pid": its process id and "b": its bundle id;
+ *              from version 5, "f": 1 on the element that has the keyboard focus (XCTest's hasKeyboardFocus)}.
  *   A key is left out where /source leaves the attribute out; "tr" also when the traits are empty, and "c" when there
  *   are no children. "r" is [0, 0, 0, 0] when a frame isn't finite (/source writes "nan" there, which reads as no
  *   frame). Strings are the ones /source writes: without the characters XML 1.0 forbids.
@@ -17,7 +18,7 @@
  *   `ms` says where the time went: the idle wait (none with animationCoolOffTimeout 0), XCTest's snapshot, and
  *   building this answer.
  *
- * GET /wda/tw/version answers 4 from this version on (see TWFastTapCommands.m).
+ * GET /wda/tw/version answers 4 from this version on, and 5 once "f" is sent (see TWFastTapCommands.m).
  *
  * Kept in this one file so the fork rebases cleanly onto upstream.
  */
@@ -191,6 +192,13 @@ static void TWDigestString(CC_SHA256_CTX *context, NSString *string)
   CC_SHA256_Update(context, &enabled, (CC_LONG)sizeof(enabled));
   if (0 == enabled) {
     node[@"d"] = @1;
+  }
+
+  // (version 5) the element with the keyboard focus: the same snapshot's value, no other question asked
+  uint8_t focused = snapshot.hasKeyboardFocus ? 1 : 0;
+  CC_SHA256_Update(context, &focused, (CC_LONG)sizeof(focused));
+  if (1 == focused) {
+    node[@"f"] = @1;
   }
 
   if (XCUIElementTypeApplication == elementType) {
