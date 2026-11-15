@@ -20,7 +20,7 @@
  *               before it lifts. Times are milliseconds from the press, in order, at most 60 s in all.
  *   orientation as for tap
  *   The answer comes once the whole drag has been played: {"ms": <synthesis ms>}.
- * GET /wda/tw/version -> {"tapwright": 5} (1: tap only; 2: tap and drag; 3: and the photo routes of
+ * GET /wda/tw/version -> {"tapwright": 6} (1: tap only; 2: tap and drag; 3: and the photo routes of
  * TWPhotosCommands.m; 4: and the compact tree read of TWTreeCommands.m, and the tap's `apps`; 5: and the tree's
  * keyboard focus "f", and the hit test GET /wda/tw/hit of TWHitCommands.m), so a client can tell which routes exist.
  *
@@ -93,7 +93,7 @@ static atomic_int twPending;
 
 + (id<FBResponsePayload>)handleVersion:(FBRouteRequest *)request
 {
-  return FBResponseWithObject(@{@"tapwright": @5});
+  return FBResponseWithObject(@{@"tapwright": @6});
 }
 
 + (NSNumber *)finiteNumber:(id)value

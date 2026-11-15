@@ -14,7 +14,60 @@
 #import "FBElementUtils.h"
 #import "FBConfiguration.h"
 #import "XCUIElement+FBUtilities.h"
+#import "FBXCAccessibilityElement.h"
+#import "FBXCElementSnapshot.h"
+#import "XCElementSnapshotDouble.h"
 #import <objc/runtime.h>
+
+// Private Tapwright command methods, exercised with synthetic AX identities only.
+@interface TWHitCommands : NSObject
++ (BOOL)snapshot:(id)snapshot matchesHit:(id)hit;
++ (id)verifiedSnapshotOf:(id)hit inApplication:(id)application via:(NSString * __autoreleasing *)via;
+@end
+
+@interface TWHitAXDouble : NSObject
+@property (nonatomic, strong) id payload;
+@property (nonatomic) int processIdentifier;
+@end
+@implementation TWHitAXDouble
+@end
+
+@interface TWHitSnapshotDouble : XCElementSnapshotDouble
+@property (nonatomic, strong) id hitElement;
+@end
+@implementation TWHitSnapshotDouble
+- (CGRect)frame { return CGRectMake(16, 82, 48, 49); }
+- (id<FBXCAccessibilityElement>)accessibilityElement { return self.hitElement; }
+@end
+
+static id TWDirectSnapshot;
+static id TWFallbackSnapshot;
+static NSUInteger TWFallbackReads;
+@interface TWHitCommandsDouble : TWHitCommands
+@end
+@implementation TWHitCommandsDouble
++ (id)snapshotOfElement:(id)hit { return TWDirectSnapshot; }
++ (id)snapshotOf:(id)hit inApplication:(id)application
+{
+  TWFallbackReads++;
+  return TWFallbackSnapshot;
+}
+@end
+
+static TWHitAXDouble *TWAX(unsigned long long elementId, int processId)
+{
+  TWHitAXDouble *element = [TWHitAXDouble new];
+  element.payload = @{@"uid.elementID": @(elementId)};
+  element.processIdentifier = processId;
+  return element;
+}
+
+static TWHitSnapshotDouble *TWSnapshot(id element)
+{
+  TWHitSnapshotDouble *snapshot = [TWHitSnapshotDouble new];
+  snapshot.hitElement = element;
+  return snapshot;
+}
 
 @interface FBQuiescenceApplicationDouble : NSObject
 @property (nonatomic) BOOL fb_shouldWaitForQuiescence;
@@ -34,6 +87,58 @@
 @end
 
 @implementation FBElementUtilitiesTests
+
+- (void)testHitSnapshotMustMatchElementAndProcessIdentity
+{
+  id hit = TWAX(123, 42);
+  XCTAssertTrue([TWHitCommands snapshot:TWSnapshot(TWAX(123, 42)) matchesHit:hit]);
+  XCTAssertFalse([TWHitCommands snapshot:TWSnapshot(TWAX(456, 42)) matchesHit:hit]);
+  XCTAssertFalse([TWHitCommands snapshot:TWSnapshot(TWAX(123, 99)) matchesHit:hit]);
+  XCTAssertFalse([TWHitCommands snapshot:TWSnapshot(nil) matchesHit:hit]);
+  XCTAssertFalse([TWHitCommands snapshot:TWSnapshot(TWAX(0, 42)) matchesHit:hit]);
+  XCTAssertFalse([TWHitCommands snapshot:nil matchesHit:hit]);
+  XCTAssertFalse([TWHitCommands snapshot:[NSObject new] matchesHit:hit]);
+}
+
+- (void)testMatchingDirectHitSnapshotDoesNotReadFallback
+{
+  id hit = TWAX(123, 42);
+  TWDirectSnapshot = TWSnapshot(TWAX(123, 42));
+  TWFallbackSnapshot = TWSnapshot(TWAX(456, 42));
+  TWFallbackReads = 0;
+  NSString *via = nil;
+  id result = [TWHitCommandsDouble verifiedSnapshotOf:hit inApplication:[NSObject new] via:&via];
+  XCTAssertEqual(result, TWDirectSnapshot);
+  XCTAssertEqualObjects(via, @"element");
+  XCTAssertEqual(TWFallbackReads, 0u);
+}
+
+- (void)testMismatchedDirectSnapshotUsesExactIdentityFallback
+{
+  id hit = TWAX(123, 42);
+  TWDirectSnapshot = TWSnapshot(TWAX(456, 42));
+  TWFallbackSnapshot = TWSnapshot(TWAX(123, 42));
+  TWFallbackReads = 0;
+  NSString *via = nil;
+  id result = [TWHitCommandsDouble verifiedSnapshotOf:hit inApplication:[NSObject new] via:&via];
+  XCTAssertEqual(result, TWFallbackSnapshot);
+  XCTAssertEqualObjects(via, @"app");
+  XCTAssertEqual(TWFallbackReads, 1u);
+}
+
+- (void)testUnprovenHitIdentityReturnsNoSnapshot
+{
+  id hit = TWAX(123, 42);
+  TWDirectSnapshot = TWSnapshot(TWAX(456, 42));
+  for (id fallback in @[TWSnapshot(TWAX(456, 42)), TWSnapshot(TWAX(123, 99)), [NSNull null]]) {
+    TWFallbackSnapshot = fallback == [NSNull null] ? nil : fallback;
+    NSString *via = nil;
+    XCTAssertNil([TWHitCommandsDouble verifiedSnapshotOf:hit inApplication:[NSObject new] via:&via]);
+    XCTAssertNil(via);
+  }
+  NSString *via = nil;
+  XCTAssertNil([TWHitCommandsDouble verifiedSnapshotOf:hit inApplication:nil via:&via]);
+}
 
 - (void)testStabilityWaitRestoresSettingsAfterAnException
 {

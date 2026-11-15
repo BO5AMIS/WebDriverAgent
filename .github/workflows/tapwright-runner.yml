@@ -17,7 +17,27 @@ env:
   XCODE_VERSION: '16.4'
 
 jobs:
+  hit-identity-tests:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ env.XCODE_VERSION }}
+      - name: Prepare the isolated CI simulator
+        run: |
+          xcodebuild -downloadPlatform iOS -buildVersion 18.5
+          xcrun simctl create TapwrightHitIdentity com.apple.CoreSimulator.SimDeviceType.iPhone-16 com.apple.CoreSimulator.SimRuntime.iOS-18-5
+          mkdir -p Resources/WebDriverAgent.bundle
+      - name: Test AX hit snapshot identity with synthetic elements
+        run: >-
+          xcodebuild test -project WebDriverAgent.xcodeproj -scheme WebDriverAgentLib
+          -sdk iphonesimulator -destination 'platform=iOS Simulator,name=TapwrightHitIdentity,OS=18.5'
+          -only-testing:UnitTests/FBElementUtilitiesTests
+          CODE_SIGNING_ALLOWED=NO
+
   build:
+    needs: hit-identity-tests
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4

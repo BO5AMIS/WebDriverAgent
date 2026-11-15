@@ -1,5 +1,5 @@
 /**
- * Tapwright: what a touch at a point lands on (route version 5).
+ * Tapwright: what a touch at a point lands on (route version 6).
  *
  * GET /wda/tw/hit?x=<x>&y=<y>   (and GET /session/:sessionId/wda/tw/hit)
  *   x, y   the point, in portrait screen points (what POST /wda/tw/tap takes).
@@ -7,7 +7,7 @@
  *   the compact tree (TWTreeCommands.m) gives the same element:
  *     {"t": the element type without "XCUIElementType", "n": name, "l": label, "r": [x, y, width, height],
  *      "pid": its application's process id, "b": that application's bundle id,
- *      "via": "element" | "app", "ms": {"hit": n, "read": n}}
+ *      "via": "element" | "app", "identity": "verified", "ms": {"hit": n, "read": n}}
  *   "n", "l" and "b" are left out when there is none.
  *   How: XCTest's daemon is asked for the element at the point (_XCT_requestElementAtPoint, the question WDA's own
  *   active application detection asks: FBActiveAppDetectionPoint), waiting at most 0.3 s. Its values are read from a
@@ -15,7 +15,7 @@
  *   found by its accessibility identity ("app"). Each snapshot may take at most TWHitReadTimeout seconds.
  *   Errors: "invalid argument" for a point that isn't two finite numbers; otherwise an "unsupported operation" error
  *   whose message starts "tapwright hit:" when nothing could be told (no element answered, or its values couldn't be
- *   read). The client then touches without this check.
+ *   read). A version-6 client refuses every failed proof; it never continues unchecked.
  *
  * Nothing here touches the phone or waits for the application to be idle.
  *
@@ -150,15 +150,13 @@ static BOOL TWUsable(id<FBXCElementSnapshot> _Nullable snapshot)
   XCUIApplication *application = pid > 0
     ? [[FBXCAXClientProxy sharedClient] monitoredApplicationWithProcessIdentifier:pid]
     : nil;
-  NSString *via = @"element";
-  id<FBXCElementSnapshot> snapshot = [self snapshotOfElement:hit];
-  if (!TWUsable(snapshot)) {
-    via = @"app";
-    snapshot = nil == application ? nil : [self snapshotOf:hit inApplication:application];
-  }
+  NSString *via = nil;
+  id<FBXCElementSnapshot> snapshot = [self verifiedSnapshotOf:hit inApplication:application via:&via];
   CFAbsoluteTime readAt = CFAbsoluteTimeGetCurrent();
-  if (!TWUsable(snapshot)) {
-    return [self refuse:@"the element at the point couldn't be read"];
+  if (nil == snapshot) {
+    // This fixed code is terminal in the companion Python client. An unbound snapshot must never be returned
+    // with the original hit's pid/bundle, or treated as an unavailable optional hit test.
+    return [self refuse:@"identity_unproven"];
   }
 
   FBXCElementSnapshotWrapper *element = [FBXCElementSnapshotWrapper ensureWrapped:(id<FBXCElementSnapshot>)snapshot];
@@ -181,8 +179,46 @@ static BOOL TWUsable(id<FBXCElementSnapshot> _Nullable snapshot)
     answer[@"b"] = bundle;
   }
   answer[@"via"] = via;
+  answer[@"identity"] = @"verified";
   answer[@"ms"] = @{@"hit": TWMilliseconds(began, asked), @"read": TWMilliseconds(asked, readAt)};
   return FBResponseWithObject(answer.copy);
+}
+
+/** Bind attributes to the same AX element AND process whose identity the point lookup returned. */
++ (BOOL)snapshot:(id<FBXCElementSnapshot>)snapshot matchesHit:(id<FBXCAccessibilityElement>)hit
+{
+  @try {
+    return TWUsable(snapshot) && nil != snapshot.accessibilityElement
+      && FBIsAXElementEqualToOther(snapshot.accessibilityElement, hit);
+  } @catch (NSException *exception) {
+    return NO;
+  }
+}
+
++ (nullable id<FBXCElementSnapshot>)verifiedSnapshotOf:(id<FBXCAccessibilityElement>)hit
+                                        inApplication:(nullable XCUIApplication *)application
+                                                  via:(NSString * _Nullable __autoreleasing *)via
+{
+  id<FBXCElementSnapshot> snapshot = nil;
+  @try {
+    snapshot = [self snapshotOfElement:hit];
+  } @catch (NSException *exception) {
+    // A failed direct read still has the exact-identity application-tree fallback.
+  }
+  if ([self snapshot:snapshot matchesHit:hit]) {
+    *via = @"element";
+    return snapshot;
+  }
+  @try {
+    snapshot = nil == application ? nil : [self snapshotOf:hit inApplication:application];
+  } @catch (NSException *exception) {
+    snapshot = nil;
+  }
+  if ([self snapshot:snapshot matchesHit:hit]) {
+    *via = @"app";
+    return snapshot;
+  }
+  return nil;
 }
 
 /** A snapshot of the element alone (it and its children), with XCTest's standard attributes; nil when it can't be
