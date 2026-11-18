@@ -10,13 +10,21 @@
  *        the library. When iOS hasn't been asked yet it asks the person once ("Allow ... to add to your photos?")
  *        and the answer waits for them. Answers {"identifiers": [local identifier, ...]} in the order sent.
  *        `names` become the pictures' file names (Photos > Recently Added shows them in the info sheet).
+ *        Version 7 also takes {items: [{kind: "photo", data: base64, name?} | {kind: "video", file: path, name?}]}:
+ *        a video is a .mp4/.mov the computer uploaded into this runner's container over house_arrest, `file` relative
+ *        to the container and under tmp/tapwright-media/. It is added by file URL and moved into the library
+ *        (shouldMoveFile), never read into memory, and only when iOS says the library takes videos
+ *        (supportsAssetResourceTypes). At most 5 videos, 200 MB each and 400 MB together; the change may take up to
+ *        10 minutes for big clips. Every staged file the call names is removed when it ends: added, refused or failed
+ *        (after a timeout, when the change finishes).
  * POST /session/:sessionId/wda/tw/photos/delete {identifiers: [string, ...]}
  *        Deletes pictures by the local identifiers `add` returned. Deleting needs FULL access, which iOS asks the
  *        person for once, and iOS asks them to confirm each delete (nothing here taps that for them). Answers
  *        {"deleted": n}: 0 when they were already gone or the person declined. Without full access it answers an
  *        error whose message starts "full access to the photo library is needed", which the client words for the user.
  *
- * Route version 3 (GET /wda/tw/version answers {"tapwright": 3}; see TWFastTapCommands.m for 1 and 2).
+ * Route version 3 (GET /wda/tw/version answers {"tapwright": 3}; see TWFastTapCommands.m for 1 and 2); videos in
+ * add (`items`) from version 7.
  *
  * Kept in this one file so the fork rebases cleanly onto upstream. The Info.plist of WebDriverAgentRunner holds the
  * two usage descriptions iOS shows in its prompts (NSPhotoLibraryAddUsageDescription, NSPhotoLibraryUsageDescription).
@@ -41,6 +49,11 @@ static const unsigned long long TWMaxBytes = 40ULL * 1024 * 1024; // all picture
 static const NSInteger TWStatusLimited = 4;
 static const NSTimeInterval TWPhotosPromptWait = 120.0; // seconds a person has to answer iOS's prompt
 static const NSTimeInterval TWPhotosChangeWait = 120.0; // seconds a change may take (a delete waits for the person's confirm)
+static const NSTimeInterval TWPhotosChangeWaitMax = 600.0; // seconds an add with big clips may take at most
+static const NSUInteger TWMaxVideos = 5; // per add
+static const unsigned long long TWMaxVideoBytes = 200ULL * 1024 * 1024; // per clip (the computer caps it too)
+static const unsigned long long TWMaxVideoTotal = 400ULL * 1024 * 1024; // all clips of one add together
+static NSString *const TWStagingFolder = @"tapwright-media"; // under the container's tmp
 
 @interface TWPhotosCommands : NSObject <FBCommandHandler>
 @end
@@ -131,70 +144,222 @@ static const NSTimeInterval TWPhotosChangeWait = 120.0; // seconds a change may 
   });
 }
 
++ (void)removeStaged:(NSArray<NSURL *> *)staged
+{
+  for (NSURL *url in staged) {
+    [NSFileManager.defaultManager removeItemAtURL:url error:nil]; // (moved into the library already: nothing there)
+  }
+}
+
+/** A refusal of an add: removes the staged clips first (the computer removes them too; neither may leave one behind). */
++ (id<FBResponsePayload>)refuse:(FBCommandStatus *)status removing:(NSArray<NSURL *> *)staged
+{
+  [self removeStaged:staged];
+  return FBResponseWithStatus(status);
+}
+
+/** The staging folder the computer uploads clips into over house_arrest: <container>/tmp/tapwright-media. */
++ (NSString *)stagingRoot
+{
+  return [[NSHomeDirectory() stringByAppendingPathComponent:@"tmp"] stringByAppendingPathComponent:TWStagingFolder];
+}
+
+/**
+ * The staged clip a container-relative path names, or nil (and `why`) when it is not a plain file inside the staging
+ * folder: no absolute path, no "." or "..", no link, nothing outside tmp/tapwright-media.
+ */
++ (NSURL *)stagedFile:(id)value size:(unsigned long long *)size why:(NSString **)why
+{
+  if (![value isKindOfClass:NSString.class] || 0 == [(NSString *)value length]) {
+    *why = @"every video must name its staged file";
+    return nil;
+  }
+  NSString *relative = (NSString *)value;
+  NSString *prefix = [@"tmp/" stringByAppendingString:TWStagingFolder];
+  if ([relative hasPrefix:@"/"] || ![relative hasPrefix:[prefix stringByAppendingString:@"/"]]
+      || [relative.pathComponents containsObject:@".."] || [relative.pathComponents containsObject:@"."]) {
+    *why = [NSString stringWithFormat:@"a staged file must be under %@/ in the runner's container", prefix];
+    return nil;
+  }
+  NSString *root = [self stagingRoot].stringByStandardizingPath;
+  NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:relative].stringByStandardizingPath;
+  if (![path hasPrefix:[root stringByAppendingString:@"/"]]) {
+    *why = @"a staged file must be inside the staging folder";
+    return nil;
+  }
+  // attributesOfItemAtPath doesn't follow a link at the end of the path: a link reads as a link, and is refused
+  NSDictionary<NSFileAttributeKey, id> *attributes = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil];
+  if (nil == attributes) {
+    *why = [NSString stringWithFormat:@"no staged file at %@", relative];
+    return nil;
+  }
+  if (![attributes[NSFileType] isEqual:NSFileTypeRegular]) {
+    *why = [NSString stringWithFormat:@"%@ is not a plain file", relative];
+    return nil;
+  }
+  *size = [attributes[NSFileSize] unsignedLongLongValue];
+  return [NSURL fileURLWithPath:path isDirectory:NO];
+}
+
 + (id<FBResponsePayload>)handleAdd:(FBRouteRequest *)request
 {
-  id images = request.arguments[@"images"];
-  if (![images isKindOfClass:NSArray.class] || 0 == [(NSArray *)images count]
-      || [(NSArray *)images count] > TWMaxPictures) {
-    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"images must be a list of 1-20 base64 pictures"
-                                                                       traceback:nil]);
-  }
-  NSArray *list = (NSArray *)images;
-  id namesValue = request.arguments[@"names"];
-  NSArray *names = [namesValue isKindOfClass:NSArray.class] ? (NSArray *)namesValue : nil;
-  if (nil != names && names.count != list.count) {
-    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"names must have one name for each picture"
-                                                                       traceback:nil]);
-  }
-  NSMutableArray<NSData *> *pictures = [NSMutableArray arrayWithCapacity:list.count];
-  unsigned long long total = 0;
-  for (id item in list) {
-    // a base64 string is a third bigger than its bytes: refuse before decoding what is over the cap
-    if ([item isKindOfClass:NSString.class]) {
-      total += (unsigned long long)([(NSString *)item length] / 4 * 3);
-      if (total > TWMaxBytes) {
-        return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"the pictures together are over the 40 MB limit"
-                                                                           traceback:nil]);
-      }
-    }
-    NSData *data = [item isKindOfClass:NSString.class]
-      ? [[NSData alloc] initWithBase64EncodedString:item options:NSDataBase64DecodingIgnoreUnknownCharacters]
-      : nil;
-    if (nil == data || 0 == data.length) {
-      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"every picture must be base64 picture data"
+  // Two shapes. Version 3: {images: [base64, ...], names?}, pictures only. Version 7: {items: [{kind: "photo",
+  // data: base64, name?} | {kind: "video", file: "tmp/tapwright-media/...", name?}, ...]}, in the order the
+  // identifiers come back. A video is a file the computer staged in this runner's container (house_arrest), added by
+  // file URL and moved into the library, so a clip is never held in memory.
+  NSMutableArray<NSDictionary *> *items = [NSMutableArray array];
+  NSTimeInterval changeWait = TWPhotosChangeWait;
+  NSMutableArray<NSURL *> *staged = [NSMutableArray array];
+  id itemsValue = request.arguments[@"items"];
+  if (nil != itemsValue) {
+    if (![itemsValue isKindOfClass:NSArray.class]) {
+      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"items must be a list"
                                                                          traceback:nil]);
     }
-    [pictures addObject:data];
+    NSArray *list = (NSArray *)itemsValue;
+    // every staged file the call names is removed on a refusal, whatever else is wrong with the call
+    for (id item in list) {
+      NSString *why = nil;
+      unsigned long long ignored = 0;
+      NSURL *url = [item isKindOfClass:NSDictionary.class] && [@"video" isEqual:((NSDictionary *)item)[@"kind"]]
+        ? [self stagedFile:((NSDictionary *)item)[@"file"] size:&ignored why:&why] : nil;
+      if (nil != url) {
+        [staged addObject:url];
+      }
+    }
+    if (0 == list.count || list.count > TWMaxPictures) {
+      return [self refuse:[FBCommandStatus invalidArgumentErrorWithMessage:@"items must be a list of 1-20 pictures and videos"
+                                                                 traceback:nil] removing:staged];
+    }
+    unsigned long long total = 0, videoTotal = 0;
+    NSUInteger videos = 0;
+    for (id item in list) {
+      if (![item isKindOfClass:NSDictionary.class]) {
+        return [self refuse:[FBCommandStatus invalidArgumentErrorWithMessage:@"every item must be an object"
+                                                                   traceback:nil] removing:staged];
+      }
+      NSDictionary *entry = (NSDictionary *)item;
+      id name = entry[@"name"];
+      NSString *named = [name isKindOfClass:NSString.class] ? (NSString *)name : @"";
+      if ([@"photo" isEqual:entry[@"kind"]]) {
+        id encoded = entry[@"data"];
+        // a base64 string is a third bigger than its bytes: refuse before decoding what is over the cap
+        if ([encoded isKindOfClass:NSString.class]) {
+          total += (unsigned long long)([(NSString *)encoded length] / 4 * 3);
+          if (total > TWMaxBytes) {
+            return [self refuse:[FBCommandStatus invalidArgumentErrorWithMessage:@"the pictures together are over the 40 MB limit"
+                                                                       traceback:nil] removing:staged];
+          }
+        }
+        NSData *data = [encoded isKindOfClass:NSString.class]
+          ? [[NSData alloc] initWithBase64EncodedString:(NSString *)encoded options:NSDataBase64DecodingIgnoreUnknownCharacters]
+          : nil;
+        if (nil == data || 0 == data.length) {
+          return [self refuse:[FBCommandStatus invalidArgumentErrorWithMessage:@"every picture must be base64 picture data"
+                                                                     traceback:nil] removing:staged];
+        }
+        [items addObject:@{@"kind": @"photo", @"data": data, @"name": named}];
+      } else if ([@"video" isEqual:entry[@"kind"]]) {
+        NSString *why = nil;
+        unsigned long long size = 0;
+        NSURL *url = [self stagedFile:entry[@"file"] size:&size why:&why];
+        if (nil == url) {
+          return [self refuse:[FBCommandStatus invalidArgumentErrorWithMessage:why traceback:nil] removing:staged];
+        }
+        videos += 1;
+        videoTotal += size;
+        if (videos > TWMaxVideos || size > TWMaxVideoBytes || videoTotal > TWMaxVideoTotal) {
+          NSString *message = [NSString stringWithFormat:@"at most %lu videos of %llu MB each, %llu MB together, in one add",
+                               (unsigned long)TWMaxVideos, TWMaxVideoBytes / 1048576, TWMaxVideoTotal / 1048576];
+          return [self refuse:[FBCommandStatus invalidArgumentErrorWithMessage:message traceback:nil] removing:staged];
+        }
+        [items addObject:@{@"kind": @"video", @"url": url, @"name": named}];
+      } else {
+        return [self refuse:[FBCommandStatus invalidArgumentErrorWithMessage:@"an item's kind must be photo or video"
+                                                                   traceback:nil] removing:staged];
+      }
+    }
+    if (videos > 0 && ![PHAssetCreationRequest supportsAssetResourceTypes:@[@(PHAssetResourceTypeVideo)]]) {
+      return [self refuse:[FBCommandStatus unsupportedOperationErrorWithMessage:@"this phone's photo library can't add videos"
+                                                                      traceback:nil] removing:staged];
+    }
+    // a clip takes longer to import than a picture: a second more for every 4 MB, 10 minutes at most
+    changeWait = MIN(TWPhotosChangeWaitMax, TWPhotosChangeWait + (NSTimeInterval)videoTotal / (4.0 * 1048576));
+  } else {
+    id images = request.arguments[@"images"];
+    if (![images isKindOfClass:NSArray.class] || 0 == [(NSArray *)images count]
+        || [(NSArray *)images count] > TWMaxPictures) {
+      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"images must be a list of 1-20 base64 pictures"
+                                                                         traceback:nil]);
+    }
+    NSArray *list = (NSArray *)images;
+    id namesValue = request.arguments[@"names"];
+    NSArray *names = [namesValue isKindOfClass:NSArray.class] ? (NSArray *)namesValue : nil;
+    if (nil != names && names.count != list.count) {
+      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"names must have one name for each picture"
+                                                                         traceback:nil]);
+    }
+    unsigned long long total = 0;
+    for (NSUInteger i = 0; i < list.count; i++) {
+      id item = list[i];
+      // a base64 string is a third bigger than its bytes: refuse before decoding what is over the cap
+      if ([item isKindOfClass:NSString.class]) {
+        total += (unsigned long long)([(NSString *)item length] / 4 * 3);
+        if (total > TWMaxBytes) {
+          return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"the pictures together are over the 40 MB limit"
+                                                                             traceback:nil]);
+        }
+      }
+      NSData *data = [item isKindOfClass:NSString.class]
+        ? [[NSData alloc] initWithBase64EncodedString:(NSString *)item options:NSDataBase64DecodingIgnoreUnknownCharacters]
+        : nil;
+      if (nil == data || 0 == data.length) {
+        return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"every picture must be base64 picture data"
+                                                                           traceback:nil]);
+      }
+      id name = nil != names ? names[i] : nil;
+      [items addObject:@{@"kind": @"photo", @"data": data,
+                         @"name": [name isKindOfClass:NSString.class] ? (NSString *)name : @""}];
+    }
   }
 
   PHAuthorizationStatus status = [self statusForFullAccess:NO askIfNeeded:YES];
   if (![self allows:status]) {
     NSString *message = [NSString stringWithFormat:@"the runner may not add to the photo library (iOS says %@)",
                          [self nameOfStatus:status]];
-    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:message traceback:nil]);
+    return [self refuse:[FBCommandStatus unknownErrorWithMessage:message traceback:nil] removing:staged];
   }
 
-  NSMutableArray<NSString *> *identifiers = [NSMutableArray arrayWithCapacity:pictures.count];
+  NSMutableArray<NSString *> *identifiers = [NSMutableArray arrayWithCapacity:items.count];
   dispatch_semaphore_t changed = dispatch_semaphore_create(0);
   __block BOOL succeeded = NO;
   __block NSError *changeError = nil;
+  NSArray<NSURL *> *leftovers = [staged copy];
   [PHPhotoLibrary.sharedPhotoLibrary performChanges:^{
-    for (NSUInteger i = 0; i < pictures.count; i++) {
+    for (NSDictionary *item in items) {
       PHAssetCreationRequest *creation = [PHAssetCreationRequest creationRequestForAsset];
       PHAssetResourceCreationOptions *options = [PHAssetResourceCreationOptions new];
-      id name = nil != names ? names[i] : nil;
-      if ([name isKindOfClass:NSString.class] && [(NSString *)name length] > 0) {
+      NSString *name = item[@"name"];
+      if (name.length > 0) {
         options.originalFilename = name;
       }
-      [creation addResourceWithType:PHAssetResourceTypePhoto data:pictures[i] options:options];
+      if ([@"video" isEqual:item[@"kind"]]) {
+        options.shouldMoveFile = YES; // the library takes the file itself: no copy of a big clip
+        [creation addResourceWithType:PHAssetResourceTypeVideo fileURL:item[@"url"] options:options];
+      } else {
+        [creation addResourceWithType:PHAssetResourceTypePhoto data:item[@"data"] options:options];
+      }
       [identifiers addObject:creation.placeholderForCreatedAsset.localIdentifier];
     }
   } completionHandler:^(BOOL success, NSError *error) {
     succeeded = success;
     changeError = error;
+    // whatever the library didn't move (a failure, or a change that ended after this route stopped waiting) goes now
+    [TWPhotosCommands removeStaged:leftovers];
     dispatch_semaphore_signal(changed);
   }];
-  if (![self waitFor:changed limit:TWPhotosChangeWait]) {
+  if (![self waitFor:changed limit:changeWait]) {
+    // the change goes on; its completion removes the staged files when it ends
     return FBResponseWithStatus([FBCommandStatus timeoutErrorWithMessage:@"adding the pictures took too long; check Photos > Recently Added"
                                                                traceback:nil]);
   }
