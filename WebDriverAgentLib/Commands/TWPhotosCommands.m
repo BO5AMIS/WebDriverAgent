@@ -166,7 +166,8 @@ static NSString *const TWStagingFolder = @"tapwright-media"; // under the contai
 
 /**
  * The staged clip a container-relative path names, or nil (and `why`) when it is not a plain file inside the staging
- * folder: no absolute path, no "." or "..", no link, nothing outside tmp/tapwright-media.
+ * folder: no absolute path, no "." or "..", no link anywhere in it (each component is read without following links),
+ * nothing outside tmp/tapwright-media, before or after resolving links.
  */
 + (NSURL *)stagedFile:(id)value size:(unsigned long long *)size why:(NSString **)why
 {
@@ -187,14 +188,32 @@ static NSString *const TWStagingFolder = @"tapwright-media"; // under the contai
     *why = @"a staged file must be inside the staging folder";
     return nil;
   }
-  // attributesOfItemAtPath doesn't follow a link at the end of the path: a link reads as a link, and is refused
-  NSDictionary<NSFileAttributeKey, id> *attributes = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil];
-  if (nil == attributes) {
-    *why = [NSString stringWithFormat:@"no staged file at %@", relative];
+  // Every component from the container down is read without following links (attributesOfItemAtPath is an lstat):
+  // each folder must be a plain folder and the last a plain file. A folder that is a link elsewhere in the sandbox
+  // would let a path that reads as inside the staging folder name a file outside it (review R179 L4).
+  NSArray<NSString *> *components = relative.pathComponents;
+  NSString *walked = NSHomeDirectory();
+  NSDictionary<NSFileAttributeKey, id> *attributes = nil;
+  for (NSUInteger i = 0; i < components.count; i++) {
+    walked = [walked stringByAppendingPathComponent:components[i]];
+    attributes = [NSFileManager.defaultManager attributesOfItemAtPath:walked error:nil];
+    if (nil == attributes) {
+      *why = [NSString stringWithFormat:@"no staged file at %@", relative];
+      return nil;
+    }
+    if (i + 1 < components.count && ![attributes[NSFileType] isEqual:NSFileTypeDirectory]) {
+      *why = [NSString stringWithFormat:@"%@ is not in plain folders (a link is never followed)", relative];
+      return nil;
+    }
+  }
+  if (nil == attributes || ![attributes[NSFileType] isEqual:NSFileTypeRegular]) {
+    *why = [NSString stringWithFormat:@"%@ is not a plain file", relative];
     return nil;
   }
-  if (![attributes[NSFileType] isEqual:NSFileTypeRegular]) {
-    *why = [NSString stringWithFormat:@"%@ is not a plain file", relative];
+  // and with every link resolved, it is still inside the staging folder (resolved the same way)
+  NSString *resolvedRoot = [self stagingRoot].stringByResolvingSymlinksInPath;
+  if (![path.stringByResolvingSymlinksInPath hasPrefix:[resolvedRoot stringByAppendingString:@"/"]]) {
+    *why = @"a staged file must be inside the staging folder";
     return nil;
   }
   *size = [attributes[NSFileSize] unsignedLongLongValue];
