@@ -11,6 +11,7 @@
 #import <arpa/inet.h>
 #import <ifaddrs.h>
 #include <notify.h>
+#include <stdatomic.h>
 #import <objc/runtime.h>
 
 #import "FBErrorBuilder.h"
@@ -109,7 +110,26 @@ NSDictionary<NSString *, NSNumber *> *fb_availableHandGestureNames(void) {
 
 @implementation XCUIDevice (FBHelpers)
 
-static bool fb_isLocked;
+// Tapwright (route version 8): the lock state is read from notifyd on every ask (fb_readIsLocked), not only kept
+// from the change callbacks. A runner started while the phone was locked, or a callback missed or delivered out of
+// order, left the cached flag wrong until the next change: seen on iOS 26, a locked phone answered "not locked" and an
+// unlocked one with Notification Center open answered "locked". The callback stays as the fallback when the live
+// read can't be had.
+static atomic_bool fb_isLocked;
+static int fb_lockStateCheckToken;
+static atomic_bool fb_hasLockStateCheckToken;
+static const char *const FBLockStateName = "com.apple.springboard.lockstate";
+
+static bool fb_readIsLocked(void)
+{
+  if (atomic_load(&fb_hasLockStateCheckToken)) {
+    uint64_t state = UINT64_MAX;
+    if (notify_get_state(fb_lockStateCheckToken, &state) == NOTIFY_STATUS_OK && state != UINT64_MAX) {
+      atomic_store(&fb_isLocked, state != 0);
+    }
+  }
+  return atomic_load(&fb_isLocked);
+}
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wobjc-load-method"
@@ -123,15 +143,22 @@ static bool fb_isLocked;
 
 + (void)fb_registerAppforDetectLockState
 {
+  int check_token;
+  if (notify_register_check(FBLockStateName, &check_token) == NOTIFY_STATUS_OK) {
+    fb_lockStateCheckToken = check_token;
+    atomic_store(&fb_hasLockStateCheckToken, true);
+  }
   int notify_token;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wstrict-prototypes"
-  notify_register_dispatch("com.apple.springboard.lockstate", &notify_token, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^(int token) {
+  notify_register_dispatch(FBLockStateName, &notify_token, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^(int token) {
     uint64_t state = UINT64_MAX;
-    notify_get_state(token, &state);
-    fb_isLocked = state != 0;
+    if (notify_get_state(token, &state) == NOTIFY_STATUS_OK && state != UINT64_MAX) {
+      atomic_store(&fb_isLocked, state != 0);
+    }
   });
 #pragma clang diagnostic pop
+  fb_readIsLocked();  // the state at start, not "unlocked" until the first change
 }
 
 - (BOOL)fb_goToHomescreenWithError:(NSError **)error
@@ -141,7 +168,7 @@ static bool fb_isLocked;
 
 - (BOOL)fb_lockScreen:(NSError **)error
 {
-  if (fb_isLocked) {
+  if (fb_readIsLocked()) {
     return YES;
   }
 #if TARGET_OS_SIMULATOR
@@ -163,18 +190,18 @@ static bool fb_isLocked;
             timeout:FBScreenLockTimeout]
            timeoutErrorMessage:@"Timed out while waiting until the screen gets locked"]
           spinUntilTrue:^BOOL{
-            return fb_isLocked;
+            return fb_readIsLocked();
           } error:error];
 }
 
 - (BOOL)fb_isScreenLocked
 {
-  return fb_isLocked;
+  return fb_readIsLocked();
 }
 
 - (BOOL)fb_unlockScreen:(NSError **)error
 {
-  if (!fb_isLocked) {
+  if (!fb_readIsLocked()) {
     return YES;
   }
   [self pressButton:XCUIDeviceButtonHome];
@@ -189,7 +216,7 @@ static bool fb_isLocked;
             timeout:FBScreenLockTimeout]
            timeoutErrorMessage:@"Timed out while waiting until the screen gets unlocked"]
           spinUntilTrue:^BOOL{
-            return !fb_isLocked;
+            return !fb_readIsLocked();
           } error:error];
 }
 
