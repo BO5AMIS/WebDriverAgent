@@ -81,7 +81,8 @@
  * GET /wda/tw/attrs   (and GET /session/:sessionId/wda/tw/attrs)   (version 10)
  *   What `attrs` can ask on this phone's XCTest, without asking any app:
  *     {"default": "std", "std": [names], "lean": [names], "leanFallback": "<why lean asks std>" (only then),
- *      "keyPaths": [the snapshot key paths lean is made from], "valid": [names a list may hold],
+ *      "keyPaths": [the snapshot key paths lean is made from], "byKeyPath": {key path: [the names XCTest gave it]},
+ *      "valid": [names a list may hold],
  *      "parameters": {XCTest's snapshot request parameters as the direct request sends them}}
  *   Names without "XC_kAXXCAttribute". "std" is missing when this XCTest can't tell its standard set.
  *
@@ -248,6 +249,18 @@ static NSArray<NSString *> *TWLeanKeyPaths(void)
 {
   return @[@"elementType", @"frame", @"label", @"identifier", @"value", @"placeholderValue", @"enabled",
            @"selected", @"traits", @"hasKeyboardFocus"];
+}
+
+/** Other spellings of a key path XCTest may know it by (a BOOL property's getter); empty when there is none. */
+static NSArray<NSString *> *TWKeyPathAlternatives(NSString *keyPath)
+{
+  if ([keyPath isEqualToString:@"enabled"]) {
+    return @[@"isEnabled"];
+  }
+  if ([keyPath isEqualToString:@"selected"]) {
+    return @[@"isSelected"];
+  }
+  return @[];
 }
 
 /**
@@ -666,21 +679,36 @@ static NSArray<NSString *> *TWStringsIn(id _Nullable value)
  *  can't tell them for every key path of TWLeanKeyPaths() (then "lean" asks "std"). */
 + (nullable NSArray<NSString *> *)leanAttributesWithProblem:(NSString * _Nullable __autoreleasing *)problem
 {
+  return [self leanAttributesWithProblem:problem byKeyPath:nil];
+}
+
+/** As leanAttributesWithProblem:, and `byKeyPath` (when given) gets the attribute names XCTest gave each key path
+ *  (short names), as far as it got. */
++ (nullable NSArray<NSString *> *)leanAttributesWithProblem:(NSString * _Nullable __autoreleasing *)problem
+                                                  byKeyPath:(NSDictionary * _Nullable __autoreleasing *)byKeyPath
+{
   static NSArray<NSString *> *lean = nil;
   static NSString *leanProblem = nil;
+  static NSDictionary *leanByKeyPath = nil;
   static dispatch_once_t onceToken;
   dispatch_once(&onceToken, ^{
     NSString *why = nil;
-    lean = [self makeLeanAttributesWithProblem:&why];
+    NSMutableDictionary *mapping = [NSMutableDictionary dictionary];
+    lean = [self makeLeanAttributesWithProblem:&why byKeyPath:mapping];
     leanProblem = nil == lean ? (why ?: @"unknown") : nil;
+    leanByKeyPath = mapping.copy;
   });
   if (nil != problem) {
     *problem = leanProblem;
+  }
+  if (nil != byKeyPath) {
+    *byKeyPath = leanByKeyPath;
   }
   return lean;
 }
 
 + (nullable NSArray<NSString *> *)makeLeanAttributesWithProblem:(NSString * _Nullable __autoreleasing *)problem
+                                                      byKeyPath:(NSMutableDictionary *)byKeyPath
 {
   Class snapshotClass = NSClassFromString(@"XCElementSnapshot");
   SEL keyPathNames = @selector(axAttributesForElementSnapshotKeyPaths:isMacOS:);
@@ -696,11 +724,18 @@ static NSArray<NSString *> *TWStringsIn(id _Nullable value)
   NSMutableOrderedSet<NSString *> *names = [NSMutableOrderedSet orderedSet];
   for (NSString *keyPath in TWLeanKeyPaths()) {
     NSArray<NSString *> *mapped = nil;
-    @try {
-      mapped = TWStringsIn([snapshotClass axAttributesForElementSnapshotKeyPaths:@[keyPath] isMacOS:NO]);
-    } @catch (NSException *e) {
-      [FBLogger logFmt:@"Tapwright tree: XCTest raised %@ naming the attributes of %@", e.reason ?: e.name, keyPath];
-      mapped = nil;
+    NSMutableArray<NSString *> *spellings = [NSMutableArray arrayWithObject:keyPath];
+    [spellings addObjectsFromArray:TWKeyPathAlternatives(keyPath)];
+    for (NSString *spelling in spellings) {
+      @try {
+        mapped = TWStringsIn([snapshotClass axAttributesForElementSnapshotKeyPaths:@[spelling] isMacOS:NO]);
+      } @catch (NSException *e) {
+        [FBLogger logFmt:@"Tapwright tree: XCTest raised %@ naming the attributes of %@", e.reason ?: e.name, spelling];
+        mapped = nil;
+      }
+      if (mapped.count > 0) {
+        break;
+      }
     }
     if (0 == mapped.count) {
       if (nil != problem) {
@@ -708,6 +743,7 @@ static NSArray<NSString *> *TWStringsIn(id _Nullable value)
       }
       return nil;
     }
+    byKeyPath[keyPath] = [self shortAttributeNames:mapped];
     [names addObjectsFromArray:mapped];
   }
   NSArray<NSString *> *sanitized = nil;
@@ -764,7 +800,8 @@ static NSArray<NSString *> *TWStringsIn(id _Nullable value)
     answer[@"std"] = [self shortAttributeNames:(NSArray<NSString *> *)standard];
   }
   NSString *leanProblem = nil;
-  NSArray<NSString *> *lean = [self leanAttributesWithProblem:&leanProblem] ?: standard;
+  NSDictionary *byKeyPath = nil;
+  NSArray<NSString *> *lean = [self leanAttributesWithProblem:&leanProblem byKeyPath:&byKeyPath] ?: standard;
   if (nil != lean) {
     answer[@"lean"] = [self shortAttributeNames:(NSArray<NSString *> *)lean];
   }
@@ -772,6 +809,7 @@ static NSArray<NSString *> *TWStringsIn(id _Nullable value)
     answer[@"leanFallback"] = leanProblem;
   }
   answer[@"keyPaths"] = TWLeanKeyPaths();
+  answer[@"byKeyPath"] = byKeyPath ?: @{};
   answer[@"valid"] = [self shortAttributeNames:[self validAttributeNames]];
 
   NSMutableDictionary<NSString *, id> *parameters = [NSMutableDictionary dictionary];
