@@ -49,6 +49,42 @@
  *   Caveat (FBXCAXClientProxy.h): a request that timed out keeps running in the AX server, so the next read may
  *   wait behind it; it is bounded the same way, and the client sees "shallow" or "root" instead of a hang.
  *
+ *   (version 10) Fewer attributes, and the snapshot's own cost:
+ *   `attrs` (path "direct" only; with "xctest" it is an "invalid argument" error) picks the accessibility attributes
+ *   the direct request asks for, per element:
+ *     "std"   XCTest's standard set (FBStandardAttributeNames: +[XCElementSnapshot
+ *             sanitizedElementSnapshotHierarchyAttributesForAttributes:nil isMacOS:NO]), what version 9 asked; the
+ *             default (TWTreeDefaultAttrs).
+ *     "lean"  only what nodeOf: reads: XCTest's own attributes for the snapshot key paths of TWLeanKeyPaths()
+ *             (+axAttributesForElementSnapshotKeyPaths:isMacOS:), put through the same sanitizer XCTest uses for a
+ *             hierarchy. When this XCTest can't tell them for every key path, "lean" asks "std" (GET /wda/tw/attrs
+ *             says why).
+ *     a comma-separated list of attribute names, with or without "XC_kAXXCAttribute", in any letter case: exactly
+ *             those, to time each one. A name that isn't one of GET /wda/tw/attrs' "valid" is an "invalid argument"
+ *             error naming the valid ones. The list isn't completed: without the type or frame attributes nodes
+ *             lose those values.
+ *   Which elements are read (the tree's shape) never depends on the attributes: the request's parameters
+ *   traverseFromParentsToChildren, maxDepth and maxChildren make the AX server walk the children, and the
+ *   snapshot's `children` come from that walk. XC_kAXXCAttributeChildren is only valid in a list when XCTest's own
+ *   std or lean sets hold it (mobile-agent found that asking for it on its own keeps the reply from decoding).
+ *   The token is a digest of the nodes only, never of `attrs`: two reads whose nodes are the same have the same
+ *   token whatever they asked; a smaller set whose nodes differ has another token (that is how to check "lean").
+ *   `arraycap` (1-2147483647, any path): XCTest's snapshot parameter maxArrayCount (default 2147483647), the most
+ *   items an array-valued attribute brings. `modal` (0 or 1, any path): snapshotKeyHonorModalViews (default 0): 1
+ *   reads only the modal view (an alert, a sheet) when one is shown, so the tree loses what it covers. Both are off
+ *   unless given, set for this read only (process-wide, as the shallow tier sets its limits) and put back after it.
+ *   Their trees may differ from the default's; compare the tokens.
+ *   `ms` gains "request" (milliseconds inside the snapshot requests themselves, all tiers; "snapshot" minus it is
+ *   the AX timeout's setting and putting back and finding the application's element) and, when the direct
+ *   request was made, "attrs" (how many attribute names it asked for).
+ *
+ * GET /wda/tw/attrs   (and GET /session/:sessionId/wda/tw/attrs)   (version 10)
+ *   What `attrs` can ask on this phone's XCTest, without asking any app:
+ *     {"default": "std", "std": [names], "lean": [names], "leanFallback": "<why lean asks std>" (only then),
+ *      "keyPaths": [the snapshot key paths lean is made from], "valid": [names a list may hold],
+ *      "parameters": {XCTest's snapshot request parameters as the direct request sends them}}
+ *   Names without "XC_kAXXCAttribute". "std" is missing when this XCTest can't tell its standard set.
+ *
  * GET /wda/tw/screen   (and GET /session/:sessionId/wda/tw/screen)   (version 9)
  *   The screen, read without asking any app:
  *     {"width": w, "height": h, "scale": s, "orientation": o, "source": "interface"|"device"|"unknown",
@@ -62,7 +98,8 @@
  *   not the screen.
  *
  * GET /wda/tw/version answers 4 from this version on, 5 once "f" is sent (see TWFastTapCommands.m), 9 once the tree
- * is bounded and the screen and OCR routes exist.
+ * is bounded and the screen and OCR routes exist, 10 once `attrs`, `arraycap`, `modal`, `ms.request`, `ms.attrs` and
+ * GET /wda/tw/attrs exist.
  *
  * Kept in this one file so the fork rebases cleanly onto upstream.
  */
@@ -111,6 +148,15 @@ static const NSUInteger TWWhyLength = 300; // characters of "why" at most
 static NSString *const TWTierFull = @"full";
 static NSString *const TWTierShallow = @"shallow";
 static NSString *const TWTierRoot = @"root";
+
+// (version 10) the attributes of the direct request
+static NSString *const TWAttrsStandard = @"std";
+static NSString *const TWAttrsLean = @"lean";
+static NSString *const TWTreeDefaultAttrs = @"std"; // what a read without `attrs` asks (version 9's set)
+static NSString *const TWAttributePrefix = @"XC_kAXXCAttribute";
+// XCTest's snapshot request parameters (XCAXClient_iOS+FBSnapshotReqParams.m lists their defaults)
+static NSString *const TWSnapshotMaxArrayCountKey = @"maxArrayCount";
+static NSString *const TWSnapshotHonorModalViewsKey = @"snapshotKeyHonorModalViews";
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -191,6 +237,64 @@ static BOOL TWTreeLooksLikeSnapshot(id _Nullable object)
     && [object respondsToSelector:@selector(accessibilityElement)];
 }
 
+/**
+ * The snapshot key paths nodeOf: reads, which "lean" asks the attributes of (version 10). Node key -> key paths:
+ * "t" elementType; "v" value, and label (static text), selected (buttons), placeholderValue (text) as wdValue
+ * reads them; "n" identifier, label; "l" label; "p" placeholderValue; "tr" traits; "r" frame; "d" enabled;
+ * "f" hasKeyboardFocus. "pid" is the snapshot's accessibilityElement (every snapshot carries it, no attribute),
+ * "b" comes from XCTest's process tracker, and "c" from the request's traversal parameters.
+ */
+static NSArray<NSString *> *TWLeanKeyPaths(void)
+{
+  return @[@"elementType", @"frame", @"label", @"identifier", @"value", @"placeholderValue", @"enabled",
+           @"selected", @"traits", @"hasKeyboardFocus"];
+}
+
+/**
+ * Attribute names known to exist on iOS 26's XCTest besides its standard set, for timing in an `attrs` list:
+ * the ones mobile-agent's runner asks in one snapshot request (gesposito/mobile-agent agent-ios/shim/Runner.m,
+ * iOS 26.6.2) and the ones WDA itself names (XCTestPrivateSymbols.m). XC_kAXXCAttributeChildren is left out on
+ * purpose (see the top of this file).
+ */
+static NSArray<NSString *> *TWKnownAttributeNames(void)
+{
+  return @[
+    @"XC_kAXXCAttributeElementType", @"XC_kAXXCAttributeElementBaseType", @"XC_kAXXCAttributeAutomationType",
+    @"XC_kAXXCAttributeLabel", @"XC_kAXXCAttributeValue", @"XC_kAXXCAttributePlaceholderValue",
+    @"XC_kAXXCAttributeIdentifier", @"XC_kAXXCAttributeFrame", @"XC_kAXXCAttributeTraits",
+    @"XC_kAXXCAttributeIsUserInteractionEnabled", @"XC_kAXXCAttributeVisibleVerticalScrollArea",
+    @"XC_kAXXCAttributeVisibleHorizontalScrollArea", @"XC_kAXXCAttributeVisibleFrame",
+    @"XC_kAXXCAttributeIsVisible", @"XC_kAXXCAttributeIsElement", @"XC_kAXXCAttributeMinValue",
+    @"XC_kAXXCAttributeMaxValue", @"XC_kAXXCAttributeCustomActions",
+  ];
+}
+
+/** The strings in what XCTest answered (an array, an ordered set or a set; a set's in sorted order); empty for
+ *  anything else. */
+static NSArray<NSString *> *TWStringsIn(id _Nullable value)
+{
+  NSArray *items = nil;
+  BOOL isUnordered = NO;
+  if ([value isKindOfClass:NSArray.class]) {
+    items = (NSArray *)value;
+  } else if ([value isKindOfClass:NSOrderedSet.class]) {
+    items = [(NSOrderedSet *)value array];
+  } else if ([value isKindOfClass:NSSet.class]) {
+    items = [(NSSet *)value allObjects];
+    isUnordered = YES;
+  }
+  NSMutableArray<NSString *> *strings = [NSMutableArray arrayWithCapacity:items.count];
+  for (id item in items) {
+    if ([item isKindOfClass:NSString.class] && [(NSString *)item length] > 0) {
+      [strings addObject:(NSString *)item];
+    }
+  }
+  if (isUnordered) {
+    [strings sortUsingSelector:@selector(compare:)];
+  }
+  return strings.copy;
+}
+
 @implementation TWTreeCommands
 
 + (NSArray *)routes
@@ -201,7 +305,116 @@ static BOOL TWTreeLooksLikeSnapshot(id _Nullable object)
     [[FBRoute GET:@"/wda/tw/tree"].withoutSession respondWithTarget:self action:@selector(handleTree:)],
     [[FBRoute GET:@"/wda/tw/screen"] respondWithTarget:self action:@selector(handleScreen:)],
     [[FBRoute GET:@"/wda/tw/screen"].withoutSession respondWithTarget:self action:@selector(handleScreen:)],
+    [[FBRoute GET:@"/wda/tw/attrs"] respondWithTarget:self action:@selector(handleAttrs:)],
+    [[FBRoute GET:@"/wda/tw/attrs"].withoutSession respondWithTarget:self action:@selector(handleAttrs:)],
   ];
+}
+
+#pragma mark - The attributes and parameters (pure, unit tested)
+
+/** The attribute name without "XC_kAXXCAttribute" (in any letter case); the name itself when it hasn't the prefix. */
++ (NSString *)shortAttributeName:(NSString *)name
+{
+  NSUInteger length = TWAttributePrefix.length;
+  if (name.length > length
+      && NSOrderedSame == [name compare:TWAttributePrefix options:NSCaseInsensitiveSearch range:NSMakeRange(0, length)]) {
+    return [name substringFromIndex:length];
+  }
+  return name;
+}
+
+/** The names without "XC_kAXXCAttribute", in their order. */
++ (NSArray<NSString *> *)shortAttributeNames:(NSArray<NSString *> *)names
+{
+  NSMutableArray<NSString *> *shortNames = [NSMutableArray arrayWithCapacity:names.count];
+  for (NSString *name in names) {
+    [shortNames addObject:[self shortAttributeName:name]];
+  }
+  return shortNames.copy;
+}
+
+/**
+ * The attributes a comma-separated `attrs` list asks for, as the names `valid` spells them: each item is one of
+ * them with or without "XC_kAXXCAttribute", in any letter case, spaces around it ignored; a repeat counts once;
+ * the list's order is kept. nil with `problem` saying why for an empty item or a name that isn't valid.
+ */
++ (nullable NSArray<NSString *> *)attributeList:(NSString *)list
+                                     validNames:(NSArray<NSString *> *)valid
+                                        problem:(NSString * _Nullable __autoreleasing *)problem
+{
+  NSMutableDictionary<NSString *, NSString *> *byKey = [NSMutableDictionary dictionaryWithCapacity:valid.count];
+  for (NSString *name in valid) {
+    byKey[[self shortAttributeName:name].lowercaseString] = name;
+  }
+  NSMutableArray<NSString *> *names = [NSMutableArray array];
+  for (NSString *raw in [list componentsSeparatedByString:@","]) {
+    NSString *item = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+    if (0 == item.length) {
+      if (nil != problem) {
+        *problem = @"attrs must be lean, std or a comma-separated list of attribute names without an empty one";
+      }
+      return nil;
+    }
+    NSString *name = byKey[[self shortAttributeName:item].lowercaseString];
+    if (nil == name) {
+      if (nil != problem) {
+        NSArray<NSString *> *known = [[self shortAttributeNames:valid] sortedArrayUsingSelector:@selector(compare:)];
+        *problem = [NSString stringWithFormat:@"attrs: unknown attribute name \"%@\"; valid: lean, std or a list of %@",
+                    item, [known componentsJoinedByString:@", "]];
+      }
+      return nil;
+    }
+    if (![names containsObject:name]) {
+      [names addObject:name];
+    }
+  }
+  return names.copy;
+}
+
+/** A whole number from 1 to INT_MAX (a snapshot parameter's count); nil for anything else. */
++ (nullable NSNumber *)snapshotCountFrom:(nullable id)value
+{
+  long long number = 0;
+  if ([value isKindOfClass:NSString.class]) {
+    NSScanner *scanner = [NSScanner scannerWithString:(NSString *)value];
+    if (![scanner scanLongLong:&number] || !scanner.isAtEnd) {
+      return nil;
+    }
+  } else if ([value isKindOfClass:NSNumber.class]) {
+    double real = [(NSNumber *)value doubleValue];
+    if (!(isfinite(real) && real >= 1 && real <= (double)INT_MAX && real == floor(real))) {
+      return nil;
+    }
+    number = (long long)real;
+  } else {
+    return nil;
+  }
+  return (number >= 1 && number <= (long long)INT_MAX) ? @((int)number) : nil;
+}
+
+/** "1"/"true" as YES, "0"/"false" as NO (also the numbers 1 and 0); nil for anything else. */
++ (nullable NSNumber *)flagFrom:(nullable id)value
+{
+  if ([value isKindOfClass:NSString.class]) {
+    NSString *text = [(NSString *)value lowercaseString];
+    if ([text isEqualToString:@"1"] || [text isEqualToString:@"true"]) {
+      return @YES;
+    }
+    if ([text isEqualToString:@"0"] || [text isEqualToString:@"false"]) {
+      return @NO;
+    }
+    return nil;
+  }
+  if ([value isKindOfClass:NSNumber.class]) {
+    double number = [(NSNumber *)value doubleValue];
+    if (1 == number) {
+      return @YES;
+    }
+    if (0 == number) {
+      return @NO;
+    }
+  }
+  return nil;
 }
 
 #pragma mark - The budget (pure, unit tested)
@@ -268,6 +481,38 @@ static BOOL TWTreeLooksLikeSnapshot(id _Nullable object)
   BOOL isLegacy = nil == request.parameters[@"budget"];
   BOOL isDirect = isLegacy ? [pathValue isEqual:@"direct"] : (nil == pathValue || [pathValue isEqualToString:@"direct"]);
   NSTimeInterval budget = isLegacy ? TWTreeMaxBudgetMs / 1000.0 : budgetSeconds.doubleValue;
+
+  // (version 10) the direct request's attributes, and the snapshot parameters asked for this read
+  id attrsValue = request.parameters[@"attrs"];
+  if (nil != attrsValue && ![attrsValue isKindOfClass:NSString.class]) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"attrs must be lean, std or a comma-separated list of attribute names"
+                                                                       traceback:nil]);
+  }
+  if (nil != attrsValue && !isDirect) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"attrs works only with path=direct"
+                                                                       traceback:nil]);
+  }
+  NSArray<NSString *> *attributes = nil; // nil: XCTest's own snapshot, as /source takes it
+  if (isDirect) {
+    NSString *attrsProblem = nil;
+    attributes = [self attributesFor:(nil == attrsValue ? TWTreeDefaultAttrs : (NSString *)attrsValue)
+                             problem:&attrsProblem];
+    if (nil != attrsProblem) {
+      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:attrsProblem traceback:nil]);
+    }
+  }
+  id arrayCapValue = request.parameters[@"arraycap"];
+  NSNumber *arrayCap = nil == arrayCapValue ? nil : [self snapshotCountFrom:arrayCapValue];
+  if (nil != arrayCapValue && nil == arrayCap) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"arraycap must be a whole number from 1 to 2147483647"
+                                                                       traceback:nil]);
+  }
+  id modalValue = request.parameters[@"modal"];
+  NSNumber *modal = nil == modalValue ? nil : [self flagFrom:modalValue];
+  if (nil != modalValue && nil == modal) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"modal must be 0 or 1"
+                                                                       traceback:nil]);
+  }
   id since = request.parameters[@"since"];
   NSMutableArray<NSString *> *why = [NSMutableArray array];
 
@@ -302,32 +547,60 @@ static BOOL TWTreeLooksLikeSnapshot(id _Nullable object)
 
   NSString *tier = nil;
   id<FBXCElementSnapshot> snapshot = nil;
+  NSTimeInterval requested = 0; // seconds inside the snapshot requests themselves
+  BOOL wasDirect = NO; // whether a direct request was made
   if (nil != application) {
-    NSString *failure = nil;
-    NSTimeInterval fullTimeout = fullEnd - stable;
-    if (fullTimeout >= TWTreeMinTier) {
-      snapshot = [self snapshotOf:(XCUIApplication *)application direct:isDirect timeout:fullTimeout failure:&failure];
-    } else {
-      failure = @"no time left";
+    // (version 10) `arraycap` and `modal` for this read only (process-wide, like the shallow tier's limits)
+    id previousArrayCap = FBGetCustomParameterForElementSnapshot(TWSnapshotMaxArrayCountKey);
+    id previousModal = FBGetCustomParameterForElementSnapshot(TWSnapshotHonorModalViewsKey);
+    if (nil != arrayCap) {
+      FBSetCustomParameterForElementSnapshot(TWSnapshotMaxArrayCountKey, (NSNumber *)arrayCap);
     }
-    if (nil != snapshot) {
-      tier = TWTierFull;
-    } else {
-      [why addObject:[NSString stringWithFormat:@"full: %@", failure]];
-      failure = nil;
-      NSTimeInterval shallowTimeout = [self shallowTimeoutOf:budget elapsed:TWNow() - began];
-      if (shallowTimeout > 0) {
-        snapshot = [self shallowSnapshotOf:(XCUIApplication *)application
-                                    direct:isDirect
-                                   timeout:shallowTimeout
-                                   failure:&failure];
+    if (nil != modal) {
+      FBSetCustomParameterForElementSnapshot(TWSnapshotHonorModalViewsKey, (NSNumber *)modal);
+    }
+    @try {
+      NSString *failure = nil;
+      NSTimeInterval fullTimeout = fullEnd - stable;
+      if (fullTimeout >= TWTreeMinTier) {
+        snapshot = [self snapshotOf:(XCUIApplication *)application
+                         attributes:attributes
+                            timeout:fullTimeout
+                          requested:&requested
+                          wasDirect:&wasDirect
+                            failure:&failure];
       } else {
         failure = @"no time left";
       }
       if (nil != snapshot) {
-        tier = TWTierShallow;
+        tier = TWTierFull;
       } else {
-        [why addObject:[NSString stringWithFormat:@"shallow: %@", failure]];
+        [why addObject:[NSString stringWithFormat:@"full: %@", failure]];
+        failure = nil;
+        NSTimeInterval shallowTimeout = [self shallowTimeoutOf:budget elapsed:TWNow() - began];
+        if (shallowTimeout > 0) {
+          snapshot = [self shallowSnapshotOf:(XCUIApplication *)application
+                                  attributes:attributes
+                                     timeout:shallowTimeout
+                                   requested:&requested
+                                   wasDirect:&wasDirect
+                                     failure:&failure];
+        } else {
+          failure = @"no time left";
+        }
+        if (nil != snapshot) {
+          tier = TWTierShallow;
+        } else {
+          [why addObject:[NSString stringWithFormat:@"shallow: %@", failure]];
+        }
+      }
+    } @finally {
+      // put back exactly what was there (nil removes the parameter again)
+      if (nil != arrayCap) {
+        FBSetCustomParameterForElementSnapshot(TWSnapshotMaxArrayCountKey, previousArrayCap);
+      }
+      if (nil != modal) {
+        FBSetCustomParameterForElementSnapshot(TWSnapshotHonorModalViewsKey, previousModal);
       }
     }
   }
@@ -358,13 +631,17 @@ static BOOL TWTreeLooksLikeSnapshot(id _Nullable object)
     NSString *text = [why componentsJoinedByString:@"; "];
     answer[@"why"] = text.length > TWWhyLength ? [text substringToIndex:TWWhyLength] : text;
   }
-  answer[@"ms"] = @{
-    @"app": TWTreeMilliseconds(began, found),
-    @"wait": TWTreeMilliseconds(found, stable),
-    @"snapshot": TWTreeMilliseconds(stable, taken),
-    @"build": TWTreeMilliseconds(taken, built),
-    @"budget": @(round(budget * 1000.0)),
-  };
+  NSMutableDictionary *ms = [NSMutableDictionary dictionaryWithCapacity:7];
+  ms[@"app"] = TWTreeMilliseconds(began, found);
+  ms[@"wait"] = TWTreeMilliseconds(found, stable);
+  ms[@"snapshot"] = TWTreeMilliseconds(stable, taken);
+  ms[@"build"] = TWTreeMilliseconds(taken, built);
+  ms[@"budget"] = @(round(budget * 1000.0));
+  ms[@"request"] = @(round(requested * 1000.0));
+  if (wasDirect) {
+    ms[@"attrs"] = @(attributes.count);
+  }
+  answer[@"ms"] = ms.copy;
   if ([since isKindOfClass:NSString.class] && [(NSString *)since isEqualToString:token]) {
     answer[@"unchanged"] = @YES;
   } else {
@@ -385,34 +662,175 @@ static BOOL TWTreeLooksLikeSnapshot(id _Nullable object)
   return attributes.count > 0 ? attributes : nil;
 }
 
+/** The attributes of "lean" (see the top of this file), made once; nil with `problem` saying why when this XCTest
+ *  can't tell them for every key path of TWLeanKeyPaths() (then "lean" asks "std"). */
++ (nullable NSArray<NSString *> *)leanAttributesWithProblem:(NSString * _Nullable __autoreleasing *)problem
+{
+  static NSArray<NSString *> *lean = nil;
+  static NSString *leanProblem = nil;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    NSString *why = nil;
+    lean = [self makeLeanAttributesWithProblem:&why];
+    leanProblem = nil == lean ? (why ?: @"unknown") : nil;
+  });
+  if (nil != problem) {
+    *problem = leanProblem;
+  }
+  return lean;
+}
+
++ (nullable NSArray<NSString *> *)makeLeanAttributesWithProblem:(NSString * _Nullable __autoreleasing *)problem
+{
+  Class snapshotClass = NSClassFromString(@"XCElementSnapshot");
+  SEL keyPathNames = @selector(axAttributesForElementSnapshotKeyPaths:isMacOS:);
+  SEL hierarchyNames = @selector(sanitizedElementSnapshotHierarchyAttributesForAttributes:isMacOS:);
+  if (nil == snapshotClass
+      || ![snapshotClass respondsToSelector:keyPathNames]
+      || ![snapshotClass respondsToSelector:hierarchyNames]) {
+    if (nil != problem) {
+      *problem = @"this XCTest can't name the attributes of snapshot key paths";
+    }
+    return nil;
+  }
+  NSMutableOrderedSet<NSString *> *names = [NSMutableOrderedSet orderedSet];
+  for (NSString *keyPath in TWLeanKeyPaths()) {
+    NSArray<NSString *> *mapped = nil;
+    @try {
+      mapped = TWStringsIn([snapshotClass axAttributesForElementSnapshotKeyPaths:@[keyPath] isMacOS:NO]);
+    } @catch (NSException *e) {
+      [FBLogger logFmt:@"Tapwright tree: XCTest raised %@ naming the attributes of %@", e.reason ?: e.name, keyPath];
+      mapped = nil;
+    }
+    if (0 == mapped.count) {
+      if (nil != problem) {
+        *problem = [NSString stringWithFormat:@"XCTest names no attribute for the key path %@", keyPath];
+      }
+      return nil;
+    }
+    [names addObjectsFromArray:mapped];
+  }
+  NSArray<NSString *> *sanitized = nil;
+  @try {
+    sanitized = TWStringsIn([snapshotClass sanitizedElementSnapshotHierarchyAttributesForAttributes:names.array
+                                                                                            isMacOS:NO]);
+  } @catch (NSException *e) {
+    [FBLogger logFmt:@"Tapwright tree: XCTest raised %@ completing the lean attributes", e.reason ?: e.name];
+    sanitized = nil;
+  }
+  if (0 == sanitized.count) {
+    if (nil != problem) {
+      *problem = @"XCTest's hierarchy sanitizer gave no attributes";
+    }
+    return nil;
+  }
+  return sanitized;
+}
+
+/** Every attribute name an `attrs` list may hold: XCTest's standard set, the lean set and TWKnownAttributeNames(). */
++ (NSArray<NSString *> *)validAttributeNames
+{
+  NSMutableOrderedSet<NSString *> *names = [NSMutableOrderedSet orderedSet];
+  [names addObjectsFromArray:[self standardAttributes] ?: @[]];
+  [names addObjectsFromArray:[self leanAttributesWithProblem:nil] ?: @[]];
+  [names addObjectsFromArray:TWKnownAttributeNames()];
+  return names.array;
+}
+
+/**
+ * The attribute names the direct request asks for `attrs` (lean, std or a list); nil without `problem` when this
+ * XCTest can't tell them (the read then takes XCTest's own snapshot, as version 9 did); nil with `problem` for a
+ * list that isn't valid.
+ */
++ (nullable NSArray<NSString *> *)attributesFor:(NSString *)attrs
+                                        problem:(NSString * _Nullable __autoreleasing *)problem
+{
+  if ([attrs isEqualToString:TWAttrsStandard]) {
+    return [self standardAttributes];
+  }
+  if ([attrs isEqualToString:TWAttrsLean]) {
+    return [self leanAttributesWithProblem:nil] ?: [self standardAttributes];
+  }
+  return [self attributeList:attrs validNames:[self validAttributeNames] problem:problem];
+}
+
+/** GET /wda/tw/attrs's answer (see the top of this file). */
++ (id<FBResponsePayload>)handleAttrs:(FBRouteRequest *)request
+{
+  NSMutableDictionary *answer = [NSMutableDictionary dictionaryWithCapacity:7];
+  answer[@"default"] = TWTreeDefaultAttrs;
+  NSArray<NSString *> *standard = [self standardAttributes];
+  if (nil != standard) {
+    answer[@"std"] = [self shortAttributeNames:(NSArray<NSString *> *)standard];
+  }
+  NSString *leanProblem = nil;
+  NSArray<NSString *> *lean = [self leanAttributesWithProblem:&leanProblem] ?: standard;
+  if (nil != lean) {
+    answer[@"lean"] = [self shortAttributeNames:(NSArray<NSString *> *)lean];
+  }
+  if (nil != leanProblem) {
+    answer[@"leanFallback"] = leanProblem;
+  }
+  answer[@"keyPaths"] = TWLeanKeyPaths();
+  answer[@"valid"] = [self shortAttributeNames:[self validAttributeNames]];
+
+  NSMutableDictionary<NSString *, id> *parameters = [NSMutableDictionary dictionary];
+  @try {
+    NSDictionary *defaults = [FBXCAXClientProxy sharedClient].defaultParameters;
+    for (id key in defaults) {
+      id value = defaults[key];
+      NSString *name = [key isKindOfClass:NSString.class] ? (NSString *)key : [key description];
+      BOOL isPlain = [value isKindOfClass:NSNumber.class] || [value isKindOfClass:NSString.class];
+      parameters[name] = isPlain ? value : ([value description] ?: @"");
+    }
+  } @catch (NSException *e) {
+    [FBLogger logFmt:@"Tapwright attrs: the snapshot parameters can't be read: %@", e.reason ?: e.name];
+  }
+  answer[@"parameters"] = parameters.copy;
+  return FBResponseWithObject(answer.copy);
+}
+
 /**
  * A snapshot of the application's tree, taken within `timeout` seconds (see "How the time is bounded" at the top),
- * or nil with `failure` saying why. `direct`: one request of XCTest's accessibility client for the application's
- * element; otherwise (or when that can't be asked on this XCTest) the snapshot /source takes.
+ * or nil with `failure` saying why. With `attributes`: one request of XCTest's accessibility client for the
+ * application's element with those attributes; without them (or when the element can't be had) the snapshot
+ * /source takes. `requested` grows by the seconds spent inside the request itself; `wasDirect` becomes YES when
+ * the direct request was made.
  */
 + (nullable id<FBXCElementSnapshot>)snapshotOf:(XCUIApplication *)application
-                                        direct:(BOOL)direct
+                                    attributes:(nullable NSArray<NSString *> *)attributes
                                        timeout:(NSTimeInterval)timeout
+                                     requested:(NSTimeInterval *)requested
+                                     wasDirect:(BOOL *)wasDirect
                                        failure:(NSString * _Nullable __autoreleasing *)failure
 {
-  NSArray<NSString *> *attributes = direct ? [self standardAttributes] : nil;
   __block id<FBXCElementSnapshot> snapshot = nil;
   __block NSString *problem = nil;
+  __block NSTimeInterval requestTook = 0;
+  __block BOOL isDirect = NO;
   NSError *timeoutError = nil;
   NSTimeInterval started = TWNow();
   TWSetSnapshotRequestDeadline(started + timeout);
   BOOL inTime = NO;
   @try {
     inTime = [[FBXCAXClientProxy sharedClient] withAXTimeout:timeout do:^{
+      // the application's own element (XCTest's process tracker knows it; asked inside the bounded scope anyway)
+      id<FBXCAccessibilityElement> element = nil;
+      if (nil != attributes) {
+        @try {
+          element = (id<FBXCAccessibilityElement>)application.accessibilityElement;
+        } @catch (NSException *e) {
+          [FBLogger logFmt:@"Tapwright tree: the application's element raised %@", e.reason ?: e.name];
+          element = nil;
+        }
+      }
+      NSTimeInterval requestStarted = TWNow();
       @try {
-        // the application's own element (XCTest's process tracker knows it; asked inside the bounded scope anyway)
-        id<FBXCAccessibilityElement> element = nil == attributes
-          ? nil
-          : (id<FBXCAccessibilityElement>)application.accessibilityElement;
         if (nil != element) {
+          isDirect = YES;
           NSError *error = nil;
           id result = [[FBXCAXClientProxy sharedClient] snapshotForElement:(id<FBXCAccessibilityElement>)element
-                                                                 attributes:attributes
+                                                                 attributes:(NSArray<NSString *> *)attributes
                                                                     inDepth:YES
                                                                       error:&error];
           if (TWTreeLooksLikeSnapshot(result)) {
@@ -432,9 +850,16 @@ static BOOL TWTreeLooksLikeSnapshot(id _Nullable object)
       } @catch (NSException *e) {
         problem = e.reason ?: e.name;
       }
+      requestTook = TWNow() - requestStarted;
     } error:&timeoutError];
   } @finally {
     TWSetSnapshotRequestDeadline(0);
+  }
+  if (NULL != requested) {
+    *requested += requestTook;
+  }
+  if (NULL != wasDirect && isDirect) {
+    *wasDirect = YES;
   }
   if (nil != snapshot) {
     return snapshot; // (even when it came a moment after the timeout: it is whole)
@@ -455,8 +880,10 @@ static BOOL TWTreeLooksLikeSnapshot(id _Nullable object)
 /** As snapshotOf:..., at most TWShallowDepth levels deep and TWShallowChildren children per element; the snapshot
  *  parameters are put back afterwards. */
 + (nullable id<FBXCElementSnapshot>)shallowSnapshotOf:(XCUIApplication *)application
-                                               direct:(BOOL)direct
+                                           attributes:(nullable NSArray<NSString *> *)attributes
                                               timeout:(NSTimeInterval)timeout
+                                            requested:(NSTimeInterval *)requested
+                                            wasDirect:(BOOL *)wasDirect
                                               failure:(NSString * _Nullable __autoreleasing *)failure
 {
   // XCTest's own default for both is INT_MAX (XCAXClient_iOS+FBSnapshotReqParams.m), which is what "not set" means
@@ -467,7 +894,12 @@ static BOOL TWTreeLooksLikeSnapshot(id _Nullable object)
   FBSetCustomParameterForElementSnapshot(FBSnapshotMaxDepthKey, @(depth));
   FBSetCustomParameterForElementSnapshot(FBSnapshotMaxChildrenKey, @(children));
   @try {
-    return [self snapshotOf:application direct:direct timeout:timeout failure:failure];
+    return [self snapshotOf:application
+                 attributes:attributes
+                    timeout:timeout
+                  requested:requested
+                  wasDirect:wasDirect
+                    failure:failure];
   } @finally {
     FBSetCustomParameterForElementSnapshot(FBSnapshotMaxDepthKey, previousDepth);
     FBSetCustomParameterForElementSnapshot(FBSnapshotMaxChildrenKey, previousChildren);

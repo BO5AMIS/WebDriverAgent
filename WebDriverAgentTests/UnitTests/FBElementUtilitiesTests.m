@@ -28,6 +28,13 @@
 + (NSTimeInterval)rootReserveOf:(NSTimeInterval)budget;
 + (NSTimeInterval)shallowTimeoutOf:(NSTimeInterval)budget elapsed:(NSTimeInterval)elapsed;
 + (CGSize)pointSizeOfPixels:(CGSize)pixels scale:(double)scale orientation:(UIInterfaceOrientation)orientation;
+// route version 10: the `attrs` list and the snapshot parameters
++ (NSString *)shortAttributeName:(NSString *)name;
++ (nullable NSArray<NSString *> *)attributeList:(NSString *)list
+                                     validNames:(NSArray<NSString *> *)valid
+                                        problem:(NSString * _Nullable __autoreleasing *)problem;
++ (nullable NSNumber *)snapshotCountFrom:(nullable id)value;
++ (nullable NSNumber *)flagFrom:(nullable id)value;
 @end
 
 @interface TWOcrCommands : NSObject
@@ -189,6 +196,64 @@ static TWHitSnapshotDouble *TWSnapshot(id element)
     double shallow = [TWTreeCommands shallowTimeoutOf:budget elapsed:full];
     XCTAssertLessThanOrEqual(full + shallow + [TWTreeCommands rootReserveOf:budget], budget + 1e-9);
   }
+}
+
+- (void)testTreeAttributeNamesLoseTheirPrefix
+{
+  XCTAssertEqualObjects([TWTreeCommands shortAttributeName:@"XC_kAXXCAttributeLabel"], @"Label");
+  XCTAssertEqualObjects([TWTreeCommands shortAttributeName:@"xc_kaxxcattributeFrame"], @"Frame");
+  XCTAssertEqualObjects([TWTreeCommands shortAttributeName:@"Label"], @"Label");
+  // the prefix alone is a name, not an empty one
+  XCTAssertEqualObjects([TWTreeCommands shortAttributeName:@"XC_kAXXCAttribute"], @"XC_kAXXCAttribute");
+}
+
+- (void)testTreeAttributeListIsCheckedAgainstTheValidNames
+{
+  NSArray<NSString *> *valid = @[@"XC_kAXXCAttributeElementType", @"XC_kAXXCAttributeLabel",
+                                 @"XC_kAXXCAttributeFrame"];
+  NSString *problem = nil;
+  NSArray<NSString *> *names = [TWTreeCommands attributeList:@"Label,frame" validNames:valid problem:&problem];
+  XCTAssertEqualObjects(names, (@[@"XC_kAXXCAttributeLabel", @"XC_kAXXCAttributeFrame"]));
+  XCTAssertNil(problem);
+  // full names, spaces and repeats
+  names = [TWTreeCommands attributeList:@" XC_kAXXCAttributeLabel , label,ElementType"
+                             validNames:valid
+                                problem:&problem];
+  XCTAssertEqualObjects(names, (@[@"XC_kAXXCAttributeLabel", @"XC_kAXXCAttributeElementType"]));
+  XCTAssertNil(problem);
+  // an empty list or an empty item
+  XCTAssertNil([TWTreeCommands attributeList:@"" validNames:valid problem:&problem]);
+  XCTAssertTrue([problem containsString:@"empty"]);
+  problem = nil;
+  XCTAssertNil([TWTreeCommands attributeList:@"Label,,Frame" validNames:valid problem:&problem]);
+  XCTAssertTrue([problem containsString:@"empty"]);
+  problem = nil;
+  // an unknown name is named, with the valid ones
+  XCTAssertNil([TWTreeCommands attributeList:@"Label,Bogus" validNames:valid problem:&problem]);
+  XCTAssertTrue([problem containsString:@"\"Bogus\""]);
+  XCTAssertTrue([problem containsString:@"ElementType, Frame, Label"]);
+}
+
+- (void)testTreeSnapshotParametersAreParsed
+{
+  XCTAssertEqualObjects([TWTreeCommands snapshotCountFrom:@"1"], @1);
+  XCTAssertEqualObjects([TWTreeCommands snapshotCountFrom:@"2147483647"], @2147483647);
+  XCTAssertEqualObjects([TWTreeCommands snapshotCountFrom:@(5)], @5);
+  XCTAssertNil([TWTreeCommands snapshotCountFrom:@"0"]);
+  XCTAssertNil([TWTreeCommands snapshotCountFrom:@"-3"]);
+  XCTAssertNil([TWTreeCommands snapshotCountFrom:@"2147483648"]);
+  XCTAssertNil([TWTreeCommands snapshotCountFrom:@"1.5"]);
+  XCTAssertNil([TWTreeCommands snapshotCountFrom:@"many"]);
+  XCTAssertNil([TWTreeCommands snapshotCountFrom:@(2.5)]);
+  XCTAssertNil([TWTreeCommands snapshotCountFrom:nil]);
+  XCTAssertEqualObjects([TWTreeCommands flagFrom:@"1"], @YES);
+  XCTAssertEqualObjects([TWTreeCommands flagFrom:@"true"], @YES);
+  XCTAssertEqualObjects([TWTreeCommands flagFrom:@"0"], @NO);
+  XCTAssertEqualObjects([TWTreeCommands flagFrom:@"FALSE"], @NO);
+  XCTAssertEqualObjects([TWTreeCommands flagFrom:@(1)], @YES);
+  XCTAssertNil([TWTreeCommands flagFrom:@"yes"]);
+  XCTAssertNil([TWTreeCommands flagFrom:@"2"]);
+  XCTAssertNil([TWTreeCommands flagFrom:nil]);
 }
 
 - (void)testScreenSizeFollowsTheInterfaceOrientation
