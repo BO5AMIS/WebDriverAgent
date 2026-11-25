@@ -22,8 +22,9 @@
  *   `ms` says where the time went: finding the application, the idle wait (none with animationCoolOffTimeout 0), the
  *   snapshots (all tiers tried), building this answer, and the budget that was used.
  *
- *   (version 9) The read answers within about `budget` milliseconds (default 3000, clamped to 500-20000; anything
- *   that isn't a number is an "invalid argument" error), in tiers:
+ *   (version 9) The read answers within about `budget` milliseconds (clamped to 500-20000; anything that isn't a
+ *   number is an "invalid argument" error). Without `budget` (a client older than version 9) the read is made the
+ *   version 8 way: `path` "xctest" and the longest budget. In tiers:
  *     "full"     the whole tree (as deep as snapshotMaxDepth allows, as before), its accessibility request bounded
  *                to the first 60 % of the budget;
  *     "shallow"  when "full" failed or ran out of time: at most 15 levels deep and 20 children per element, with
@@ -262,8 +263,11 @@ static BOOL TWTreeLooksLikeSnapshot(id _Nullable object)
     return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"path must be direct or xctest"
                                                                        traceback:nil]);
   }
-  BOOL isDirect = nil == pathValue || [pathValue isEqualToString:@"direct"];
-  NSTimeInterval budget = budgetSeconds.doubleValue;
+  // A request without `budget` comes from a client older than version 9 (Tapwright 1.x): it gets what version 8
+  // gave it, XCTest's own snapshot, with the longest budget, so that it never takes a shallow tree for the screen.
+  BOOL isLegacy = nil == request.parameters[@"budget"];
+  BOOL isDirect = isLegacy ? [pathValue isEqual:@"direct"] : (nil == pathValue || [pathValue isEqualToString:@"direct"]);
+  NSTimeInterval budget = isLegacy ? TWTreeMaxBudgetMs / 1000.0 : budgetSeconds.doubleValue;
   id since = request.parameters[@"since"];
   NSMutableArray<NSString *> *why = [NSMutableArray array];
 
