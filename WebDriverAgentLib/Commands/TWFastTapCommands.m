@@ -20,10 +20,12 @@
  *               before it lifts. Times are milliseconds from the press, in order, at most 60 s in all.
  *   orientation as for tap
  *   The answer comes once the whole drag has been played: {"ms": <synthesis ms>}.
- * GET /wda/tw/version -> {"tapwright": 8} (1: tap only; 2: tap and drag; 3: and the photo routes of
+ * GET /wda/tw/version -> {"tapwright": 9} (1: tap only; 2: tap and drag; 3: and the photo routes of
  * TWPhotosCommands.m; 4: and the compact tree read of TWTreeCommands.m, and the tap's `apps`; 5: and the tree's
  * keyboard focus "f", and the hit test GET /wda/tw/hit of TWHitCommands.m; 6: hit snapshots bound to their
- * accessibility identity; 7: videos in the photo add of TWPhotosCommands.m; 8: /wda/locked read live from notifyd on every ask), so a client can tell which routes exist.
+ * accessibility identity; 7: videos in the photo add of TWPhotosCommands.m; 8: /wda/locked read live from notifyd on every ask;
+ * 9: the tree read bounded by `budget` with "tier"/"truncated", GET /wda/tw/screen (TWTreeCommands.m), GET /wda/tw/ocr
+ * (TWOcrCommands.m) and the twAXTimeout setting), so a client can tell which routes exist.
  *
  * Unlike /wda/tap and /actions, nothing here reads the application: no element lookup, no
  * snapshot, no interface orientation query and no idle or quiescence wait. One touch path is
@@ -94,7 +96,7 @@ static atomic_int twPending;
 
 + (id<FBResponsePayload>)handleVersion:(FBRouteRequest *)request
 {
-  return FBResponseWithObject(@{@"tapwright": @8});
+  return FBResponseWithObject(@{@"tapwright": @9});
 }
 
 + (NSNumber *)finiteNumber:(id)value

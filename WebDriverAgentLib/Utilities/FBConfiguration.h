@@ -246,6 +246,16 @@ typedef NS_ENUM(NSInteger, FBConfigurationKeyboardPreference) {
 @property (atomic, assign) NSTimeInterval accessibilityDeadline;
 
 /**
+ * Tapwright (route version 9): seconds any one accessibility (AX) request of this process may wait for its answer
+ * (XCTest's AXTimeout), so that a read of an app that answers slowly (session creation, window/size, alerts,
+ * element lookups and snapshots) fails in about that time instead of 15-60 s. The requests that time out fail
+ * the way XCTest fails them (see TWTreeCommands.m for what a client sees).
+ * Zero or negative (the default) keeps XCTest's own value. Reset with the other session settings.
+ * Tapwright's bounded reads (GET /wda/tw/tree) set their own timeout for their requests and then put this back.
+ */
+@property (atomic, assign) NSTimeInterval twAXTimeout;
+
+/**
  Custom class chain locator for accept alert button location.
  This might be useful if the default buttons detection algorithm fails to determine alert buttons properly
  when defaultAlertAction is set.

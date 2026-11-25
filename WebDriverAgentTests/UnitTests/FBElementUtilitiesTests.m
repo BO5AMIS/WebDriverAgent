@@ -18,6 +18,23 @@
 #import "FBXCElementSnapshot.h"
 #import "XCElementSnapshotDouble.h"
 #import <objc/runtime.h>
+#import <ImageIO/ImageIO.h>
+#import <UIKit/UIKit.h>
+
+// Private Tapwright route version 9 methods: their pure logic only (the budget split and the geometry).
+@interface TWTreeCommands : NSObject
++ (nullable NSNumber *)budgetSecondsFrom:(nullable id)value;
++ (NSTimeInterval)fullShareOf:(NSTimeInterval)budget;
++ (NSTimeInterval)rootReserveOf:(NSTimeInterval)budget;
++ (NSTimeInterval)shallowTimeoutOf:(NSTimeInterval)budget elapsed:(NSTimeInterval)elapsed;
++ (CGSize)pointSizeOfPixels:(CGSize)pixels scale:(double)scale orientation:(UIInterfaceOrientation)orientation;
+@end
+
+@interface TWOcrCommands : NSObject
++ (CGImagePropertyOrientation)propertyOrientationOf:(UIImageOrientation)orientation;
++ (CGSize)uprightSizeOf:(CGSize)size orientation:(UIImageOrientation)orientation;
++ (CGRect)screenRectOfNormalizedBox:(CGRect)box inSize:(CGSize)size;
+@end
 
 // Private Tapwright command methods, exercised with synthetic AX identities only.
 @interface TWHitCommands : NSObject
@@ -138,6 +155,98 @@ static TWHitSnapshotDouble *TWSnapshot(id element)
   }
   NSString *via = nil;
   XCTAssertNil([TWHitCommandsDouble verifiedSnapshotOf:hit inApplication:nil via:&via]);
+}
+
+- (void)testTreeBudgetIsClampedAndDefaulted
+{
+  XCTAssertEqualWithAccuracy([TWTreeCommands budgetSecondsFrom:nil].doubleValue, 3.0, 1e-9);
+  XCTAssertEqualWithAccuracy([TWTreeCommands budgetSecondsFrom:@"1500"].doubleValue, 1.5, 1e-9);
+  XCTAssertEqualWithAccuracy([TWTreeCommands budgetSecondsFrom:@(2500)].doubleValue, 2.5, 1e-9);
+  XCTAssertEqualWithAccuracy([TWTreeCommands budgetSecondsFrom:@"100"].doubleValue, 0.5, 1e-9);
+  XCTAssertEqualWithAccuracy([TWTreeCommands budgetSecondsFrom:@"99999"].doubleValue, 20.0, 1e-9);
+  XCTAssertNil([TWTreeCommands budgetSecondsFrom:@"3s"]);
+  XCTAssertNil([TWTreeCommands budgetSecondsFrom:@""]);
+  XCTAssertNil([TWTreeCommands budgetSecondsFrom:@[]]);
+}
+
+- (void)testTreeBudgetSplitLeavesTimeForEveryTier
+{
+  XCTAssertEqualWithAccuracy([TWTreeCommands fullShareOf:3.0], 1.8, 1e-9);
+  XCTAssertEqualWithAccuracy([TWTreeCommands rootReserveOf:0.5], 0.2, 1e-9);
+  XCTAssertEqualWithAccuracy([TWTreeCommands rootReserveOf:3.0], 0.3, 1e-9);
+  XCTAssertEqualWithAccuracy([TWTreeCommands rootReserveOf:20.0], 1.0, 1e-9);
+  // after a failed full tier, the shallow tier gets the rest but the root tier's reserve
+  XCTAssertEqualWithAccuracy([TWTreeCommands shallowTimeoutOf:3.0 elapsed:1.8], 0.9, 1e-9);
+  XCTAssertEqualWithAccuracy([TWTreeCommands shallowTimeoutOf:20.0 elapsed:12.0], 7.0, 1e-9);
+  // too little left: the shallow tier is not tried
+  XCTAssertEqualWithAccuracy([TWTreeCommands shallowTimeoutOf:0.5 elapsed:0.3], 0.0, 1e-9);
+  XCTAssertEqualWithAccuracy([TWTreeCommands shallowTimeoutOf:3.0 elapsed:2.9], 0.0, 1e-9);
+  // the tiers never add up to more than the budget
+  double budgets[] = {0.5, 1.0, 3.0, 7.5, 20.0};
+  for (size_t i = 0; i < sizeof(budgets) / sizeof(budgets[0]); i++) {
+    double budget = budgets[i];
+    double full = [TWTreeCommands fullShareOf:budget];
+    double shallow = [TWTreeCommands shallowTimeoutOf:budget elapsed:full];
+    XCTAssertLessThanOrEqual(full + shallow + [TWTreeCommands rootReserveOf:budget], budget + 1e-9);
+  }
+}
+
+- (void)testScreenSizeFollowsTheInterfaceOrientation
+{
+  CGSize portrait = [TWTreeCommands pointSizeOfPixels:CGSizeMake(1179, 2556)
+                                                scale:3
+                                          orientation:UIInterfaceOrientationPortrait];
+  XCTAssertEqualWithAccuracy(portrait.width, 393.0, 1e-9);
+  XCTAssertEqualWithAccuracy(portrait.height, 852.0, 1e-9);
+  CGSize landscape = [TWTreeCommands pointSizeOfPixels:CGSizeMake(1179, 2556)
+                                                 scale:3
+                                           orientation:UIInterfaceOrientationLandscapeLeft];
+  XCTAssertEqualWithAccuracy(landscape.width, 852.0, 1e-9);
+  XCTAssertEqualWithAccuracy(landscape.height, 393.0, 1e-9);
+  // a landscape-native panel in an unknown orientation is told as portrait
+  CGSize unknown = [TWTreeCommands pointSizeOfPixels:CGSizeMake(2556, 1179)
+                                               scale:3
+                                         orientation:UIInterfaceOrientationUnknown];
+  XCTAssertEqualWithAccuracy(unknown.width, 393.0, 1e-9);
+  XCTAssertEqualWithAccuracy(unknown.height, 852.0, 1e-9);
+  CGSize unscaled = [TWTreeCommands pointSizeOfPixels:CGSizeMake(320, 480)
+                                                scale:0
+                                          orientation:UIInterfaceOrientationPortrait];
+  XCTAssertEqualWithAccuracy(unscaled.width, 320.0, 1e-9);
+  XCTAssertEqualWithAccuracy(unscaled.height, 480.0, 1e-9);
+}
+
+- (void)testOcrBoxesBecomeTopLeftScreenPoints
+{
+  CGRect rect = [TWOcrCommands screenRectOfNormalizedBox:CGRectMake(0.1, 0.7, 0.5, 0.2)
+                                                  inSize:CGSizeMake(400, 800)];
+  XCTAssertEqualWithAccuracy(rect.origin.x, 40.0, 1e-6);
+  XCTAssertEqualWithAccuracy(rect.origin.y, 80.0, 1e-6);
+  XCTAssertEqualWithAccuracy(rect.size.width, 200.0, 1e-6);
+  XCTAssertEqualWithAccuracy(rect.size.height, 160.0, 1e-6);
+  CGRect top = [TWOcrCommands screenRectOfNormalizedBox:CGRectMake(0, 0.9, 1, 0.1) inSize:CGSizeMake(400, 800)];
+  XCTAssertEqualWithAccuracy(top.origin.y, 0.0, 1e-6);
+  XCTAssertEqualWithAccuracy(top.size.height, 80.0, 1e-6);
+  CGRect bottom = [TWOcrCommands screenRectOfNormalizedBox:CGRectMake(0, 0, 1, 0.1) inSize:CGSizeMake(400, 800)];
+  XCTAssertEqualWithAccuracy(bottom.origin.y, 720.0, 1e-6);
+}
+
+- (void)testOcrPicturesAreTurnedUpright
+{
+  CGSize turned = [TWOcrCommands uprightSizeOf:CGSizeMake(1179, 2556) orientation:UIImageOrientationRight];
+  XCTAssertEqualWithAccuracy(turned.width, 2556.0, 1e-9);
+  XCTAssertEqualWithAccuracy(turned.height, 1179.0, 1e-9);
+  CGSize upright = [TWOcrCommands uprightSizeOf:CGSizeMake(1179, 2556) orientation:UIImageOrientationUp];
+  XCTAssertEqualWithAccuracy(upright.width, 1179.0, 1e-9);
+  XCTAssertEqualWithAccuracy(upright.height, 2556.0, 1e-9);
+  XCTAssertEqual((NSInteger)[TWOcrCommands propertyOrientationOf:UIImageOrientationUp],
+                 (NSInteger)kCGImagePropertyOrientationUp);
+  XCTAssertEqual((NSInteger)[TWOcrCommands propertyOrientationOf:UIImageOrientationRight],
+                 (NSInteger)kCGImagePropertyOrientationRight);
+  XCTAssertEqual((NSInteger)[TWOcrCommands propertyOrientationOf:UIImageOrientationLeft],
+                 (NSInteger)kCGImagePropertyOrientationLeft);
+  XCTAssertEqual((NSInteger)[TWOcrCommands propertyOrientationOf:UIImageOrientationDown],
+                 (NSInteger)kCGImagePropertyOrientationDown);
 }
 
 - (void)testStabilityWaitRestoresSettingsAfterAnException

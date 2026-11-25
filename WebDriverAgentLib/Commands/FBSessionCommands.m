@@ -314,6 +314,9 @@
   if (nil != capabilities[FB_SETTING_ACCESSIBILITY_DEADLINE]) {
     FBConfiguration.sharedInstance.accessibilityDeadline = [capabilities[FB_SETTING_ACCESSIBILITY_DEADLINE] doubleValue];
   }
+  if (nil != capabilities[FB_SETTING_TW_AX_TIMEOUT]) {
+    FBConfiguration.sharedInstance.twAXTimeout = [capabilities[FB_SETTING_TW_AX_TIMEOUT] doubleValue];
+  }
   if (nil == capabilities[FB_CAP_FORCE_SIMULATOR_SOFTWARE_KEYBOARD_PRESENCE] ||
       [capabilities[FB_CAP_FORCE_SIMULATOR_SOFTWARE_KEYBOARD_PRESENCE] boolValue]) {
     [FBConfiguration.sharedInstance forceSimulatorSoftwareKeyboardPresence];

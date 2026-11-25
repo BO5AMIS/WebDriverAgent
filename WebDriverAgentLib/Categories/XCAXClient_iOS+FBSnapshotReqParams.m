@@ -9,6 +9,7 @@
 #import "XCAXClient_iOS+FBSnapshotReqParams.h"
 
 #import <objc/runtime.h>
+#import <stdatomic.h>
 
 #import "FBConfiguration.h"
 #import "FBErrorBuilder.h"
@@ -69,6 +70,23 @@ static id swizzledSnapshotParameters(id self, SEL _cmd)
 
 static id (*original_requestSnapshotForElement)(id, SEL, id, id, id, NSError **);
 
+// Tapwright: see TWSetSnapshotRequestDeadline in the header. 0 = no deadline.
+static _Atomic(double) twSnapshotRequestDeadline = 0.0;
+
+void TWSetSnapshotRequestDeadline(NSTimeInterval deadline)
+{
+  atomic_store(&twSnapshotRequestDeadline, deadline > 0 ? deadline : 0.0);
+}
+
+static NSError *TWBuildSnapshotDeadlineError(void)
+{
+  NSError *error;
+  [[[FBErrorBuilder builder]
+    withDescription:@"tapwright: the bounded read's time is up; the accessibility snapshot request was not made"]
+   buildError:&error];
+  return error;
+}
+
 // pid -> last-unresponsive-at. XCTest retries a failed snapshot request several
 // times in a row; this lets retries fail fast within `timeout` of the last check
 // instead of each re-running the full wait.
@@ -96,6 +114,16 @@ static NSError *FBBuildUnresponsiveApplicationError(int pid, NSTimeInterval time
 // wait; otherwise falls through to the original, unbounded behavior.
 static id swizzledRequestSnapshotForElement(id self, SEL _cmd, id element, id attributes, id parameters, NSError **error)
 {
+  // Tapwright: a bounded read's deadline (TWSetSnapshotRequestDeadline): past it, no request is made at all
+  double twDeadline = atomic_load(&twSnapshotRequestDeadline);
+  NSTimeInterval twLeft = twDeadline > 0 ? twDeadline - NSProcessInfo.processInfo.systemUptime : DBL_MAX;
+  if (twLeft <= 0) {
+    if (nil != error) {
+      *error = TWBuildSnapshotDeadlineError();
+    }
+    return nil;
+  }
+
   NSTimeInterval timeout = FBConfiguration.sharedInstance.accessibilityDeadline;
   if (timeout < DBL_EPSILON) {
     return original_requestSnapshotForElement(self, _cmd, element, attributes, parameters, error);
@@ -135,12 +163,22 @@ static id swizzledRequestSnapshotForElement(id self, SEL _cmd, id element, id at
     isResponsive = (nil == idleError);
     dispatch_semaphore_signal(sem);
   }];
-  BOOL didReplyInTime = 0 == dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC)));
+  // Tapwright: the check waits no longer than a bounded read's deadline allows
+  BOOL isCutShort = twLeft < timeout;
+  NSTimeInterval checkTimeout = isCutShort ? twLeft : timeout;
+  BOOL didReplyInTime = 0 == dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(checkTimeout * NSEC_PER_SEC)));
   if (didReplyInTime && isResponsive) {
     @synchronized (unresponsiveApplicationPidsLock) {
       [unresponsiveApplicationPids removeObjectForKey:pidKey];
     }
     return original_requestSnapshotForElement(self, _cmd, element, attributes, parameters, error);
+  }
+  if (!didReplyInTime && isCutShort) {
+    // the deadline ended the wait, not the app: it isn't marked unresponsive for later reads
+    if (nil != error) {
+      *error = TWBuildSnapshotDeadlineError();
+    }
+    return nil;
   }
 
   @synchronized (unresponsiveApplicationPidsLock) {

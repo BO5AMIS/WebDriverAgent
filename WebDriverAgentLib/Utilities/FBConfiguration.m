@@ -17,6 +17,9 @@
 #import <UIKit/UIKit.h>
 
 #include "TargetConditionals.h"
+#include <stdatomic.h>
+#import "FBLogger.h"
+#import "FBXCAXClientProxy.h"
 #import "FBXCodeCompatibility.h"
 #import "XCAXClient_iOS+FBSnapshotReqParams.h"
 #import "XCTestPrivateSymbols.h"
@@ -33,6 +36,8 @@ static NSString *const controllerClassName = @"TIPreferencesController";
 static NSString *const FBKeyboardAutocorrectionKey = @"KeyboardAutocorrection";
 static NSString *const FBKeyboardPredictionKey = @"KeyboardPrediction";
 static NSString *const axSettingsClassName = @"AXSettings";
+// Tapwright: the twAXTimeout setting (seconds; 0 = XCTest's own)
+static _Atomic(double) FBTWAXTimeoutValue = 0.0;
 
 @interface FBConfiguration ()
 
@@ -289,6 +294,21 @@ static NSString *const axSettingsClassName = @"AXSettings";
   return [FBGetCustomParameterForElementSnapshot(FBSnapshotMaxChildrenKey) intValue];
 }
 
+- (void)setTwAXTimeout:(NSTimeInterval)timeout
+{
+  NSTimeInterval value = (isfinite(timeout) && timeout > 0) ? timeout : 0.0;
+  atomic_store(&FBTWAXTimeoutValue, value);
+  NSError *error;
+  if (![FBXCAXClientProxy setBaseAXTimeout:value error:&error]) {
+    [FBLogger logFmt:@"The twAXTimeout setting of %@ s could not be applied: %@", @(value), error.localizedDescription];
+  }
+}
+
+- (NSTimeInterval)twAXTimeout
+{
+  return atomic_load(&FBTWAXTimeoutValue);
+}
+
 #if !TARGET_OS_TV && !TARGET_OS_WATCH
 - (BOOL)setScreenshotOrientation:(NSString *)orientation error:(NSError **)error
 {
@@ -352,6 +372,7 @@ static NSString *const axSettingsClassName = @"AXSettings";
   self.waitForIdleTimeout = 10.;
   self.animationCoolOffTimeout = 2.;
   self.accessibilityDeadline = 0.;
+  self.twAXTimeout = 0.;
   // 50 should be enough for the majority of the cases. The performance is acceptable for values up to 100.
   FBSetCustomParameterForElementSnapshot(FBSnapshotMaxDepthKey, @50);
   FBSetCustomParameterForElementSnapshot(FBSnapshotMaxChildrenKey, @INT_MAX);

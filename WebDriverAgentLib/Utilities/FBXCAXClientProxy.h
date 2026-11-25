@@ -92,6 +92,16 @@ NS_ASSUME_NONNULL_BEGIN
 - (BOOL)withAXTimeout:(NSTimeInterval)timeout do:(void (^)(void))block error:(NSError **)error;
 
 /**
+ Tapwright (route version 9, the `twAXTimeout` setting): sets the process-wide AXTimeout that is in force outside
+ every -withAXTimeout:do:error: scope (those restore to it). `timeout` <= 0 puts back XCTest's own value, saved
+ before the first change; while nothing was changed it does nothing at all (not even create the AX client).
+ Serialized behind the same lock as -withAXTimeout:do:error:.
+
+ Returns NO, with `error` set, when XCTest refuses the value.
+ */
++ (BOOL)setBaseAXTimeout:(NSTimeInterval)timeout error:(NSError **)error;
+
+/**
  Runs `block` synchronously with the XCTest automation-session XPC request timeout
  (the private `_XCTXPCRequestTimeout`/`_XCTSetXPCRequestTimeout` globals) temporarily
  set to `timeout`, restoring the previous value once `block` returns (even if it

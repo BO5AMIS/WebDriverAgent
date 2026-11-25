@@ -106,6 +106,40 @@ static NSRecursiveLock *FBApplicationStateTimeoutLock(void)
   }
 }
 
+// Tapwright: XCTest's own AXTimeout, saved before +setBaseAXTimeout:error: first changes it (nil while unchanged).
+static NSNumber *FBXCTestOwnAXTimeout = nil;
+
++ (BOOL)setBaseAXTimeout:(NSTimeInterval)timeout error:(NSError **)error
+{
+  NSRecursiveLock *lock = FBAXTimeoutLock();
+  [lock lock];
+  @try {
+    BOOL isReset = !(isfinite(timeout) && timeout > 0);
+    if (isReset && nil == FBXCTestOwnAXTimeout) {
+      return YES;
+    }
+    (void)[self sharedClient]; // FBAXClient is made there
+    if (nil == FBXCTestOwnAXTimeout) {
+      FBXCTestOwnAXTimeout = @([FBAXClient AXTimeout]);
+    }
+    NSTimeInterval value = isReset ? FBXCTestOwnAXTimeout.doubleValue : timeout;
+    NSError *setError;
+    if (![FBAXClient _setAXTimeout:value error:&setError]) {
+      [FBLogger logFmt:@"Failed to set the base AXTimeout to %@: %@", @(value), setError];
+      if (nil != error) {
+        *error = setError;
+      }
+      return NO;
+    }
+    if (isReset) {
+      FBXCTestOwnAXTimeout = nil;
+    }
+    return YES;
+  } @finally {
+    [lock unlock];
+  }
+}
+
 + (BOOL)withXPCRequestTimeout:(NSTimeInterval)timeout do:(void (^)(void))block
 {
   NSRecursiveLock *lock = FBXPCRequestTimeoutLock();
