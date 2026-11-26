@@ -20,7 +20,7 @@
  *               before it lifts. Times are milliseconds from the press, in order, at most 60 s in all.
  *   orientation as for tap
  *   The answer comes once the whole drag has been played: {"ms": <synthesis ms>}.
- * GET /wda/tw/version -> {"tapwright": 11} (1: tap only; 2: tap and drag; 3: and the photo routes of
+ * GET /wda/tw/version -> {"tapwright": 12} (12: the OCR reads a turned screen upright; 1: tap only; 2: tap and drag; 3: and the photo routes of
  * TWPhotosCommands.m; 4: and the compact tree read of TWTreeCommands.m, and the tap's `apps`; 5: and the tree's
  * keyboard focus "f", and the hit test GET /wda/tw/hit of TWHitCommands.m; 6: hit snapshots bound to their
  * accessibility identity; 7: videos in the photo add of TWPhotosCommands.m; 8: /wda/locked read live from notifyd on every ask;
@@ -98,7 +98,7 @@ static atomic_int twPending;
 
 + (id<FBResponsePayload>)handleVersion:(FBRouteRequest *)request
 {
-  return FBResponseWithObject(@{@"tapwright": @11});
+  return FBResponseWithObject(@{@"tapwright": @12});
 }
 
 + (NSNumber *)finiteNumber:(id)value

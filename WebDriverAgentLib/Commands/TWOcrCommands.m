@@ -463,8 +463,29 @@ static NSNumber *TWOcrTenth(CGFloat value)
   if (nil != languages) {
     recognition.recognitionLanguages = (NSArray<NSString *> *)languages;
   }
-  VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:picture
-                                                                      orientation:[self propertyOrientationOf:imageOrientation]
+  // (version 12) A turned screenshot is drawn upright first, the way the JPEG that is sent is drawn, and Vision
+  // reads that picture as it is. Told the screenshot's orientation instead, Vision found the text in the right
+  // places but read it upside down in both landscape turns (iPhone 14 Pro Max, iOS 26.5: Calculator's "789" came
+  // back as "68L"). Only a turned screenshot pays for the drawing.
+  CGImageRef toRead = picture;
+  CGImagePropertyOrientation toldOrientation = [self propertyOrientationOf:imageOrientation];
+  UIImage *turned = nil;
+  if (UIImageOrientationUp != imageOrientation && upright.width >= 1 && upright.height >= 1) {
+    UIGraphicsImageRendererFormat *format = [[UIGraphicsImageRendererFormat alloc] init];
+    format.scale = 1;
+    format.opaque = YES;
+    format.preferredRange = UIGraphicsImageRendererFormatRangeStandard;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:upright format:format];
+    turned = [renderer imageWithActions:^(UIGraphicsImageRendererContext * _Nonnull context) {
+      [image drawInRect:CGRectMake(0, 0, upright.width, upright.height)];
+    }];
+    if (NULL != turned.CGImage) {
+      toRead = turned.CGImage;
+      toldOrientation = kCGImagePropertyOrientationUp;
+    }
+  }
+  VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:toRead
+                                                                      orientation:toldOrientation
                                                                           options:@{}];
   NSError *visionError = nil;
   BOOL isRead = NO;
