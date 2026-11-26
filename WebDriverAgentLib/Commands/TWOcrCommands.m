@@ -20,8 +20,34 @@
  *   when the screenshot fails; otherwise an "unknown error" whose message starts "tapwright ocr:" (Vision failed,
  *   e.g. an unsupported language); "unsupported operation" before iOS 13.
  *
- * Every route runs on the main queue (FBWebServer), and so does this one: the main thread is busy while Vision
- * reads (about 0.1-0.3 s "fast", 0.5-1.5 s "accurate" on a recent iPhone), and nothing else is answered meanwhile.
+ *   (version 11) `image=1` (also "true"; "0"/"false" or no `image` is the version 10 answer, unchanged), with
+ *   `width` and `quality` as for GET /wda/tw/shot below: the answer also carries the very picture the text was read
+ *   from, made as GET /wda/tw/shot makes it, and how long that took:
+ *     {..., "jpeg": "<base64>", "size": [w, h], "ms": {"shot": n, "ocr": n, "encode": n}}
+ *   Vision always reads the full-resolution screenshot; `width` only scales the picture that is sent. `width` and
+ *   `quality` are not looked at without `image=1`. Errors: "invalid argument" for another `image`, a bad `width` or
+ *   `quality`; an "unknown error" "tapwright ocr: the picture could not be encoded".
+ *
+ * GET /wda/tw/shot?width=<px>&quality=<1-100>   (and GET /session/:sessionId/wda/tw/shot)   (version 11)
+ *   The screen as a JPEG, taken the way the OCR read takes it (XCTest's daemon, no accessibility question to any
+ *   app), turned upright (the orientation iOS writes into the screenshot's metadata, as the OCR read honours it):
+ *     {"jpeg": "<base64>", "size": [w, h], "screen": [w, h], "ms": {"shot": n, "encode": n}}
+ *   width    pixels of the picture sent, a whole number; clamped to 120..the screenshot's own upright width; the
+ *            height follows the screen's proportions (rounded). Default: the screenshot's own pixels.
+ *   quality  JPEG quality, a whole number 1-100 (default 70).
+ *   size     [w, h] in pixels of the picture sent; screen  [w, h] the screen in points, upright (as the OCR read's);
+ *   ms       shot: the daemon's screenshot; encode: turning, scaling, encoding and base64.
+ *   When nothing needs turning or scaling (portrait, no `width`), the daemon's own JPEG, taken at `quality`, is sent
+ *   as it is (encode is then about the base64 alone). Otherwise the screenshot is taken at quality 80 or more and
+ *   drawn upright at `size` (UIGraphicsImageRenderer, as FBImageProcessor scales the MJPEG stream), then encoded at
+ *   `quality`.
+ *   Errors: "invalid argument" for a `width` that isn't a whole number from 1 or a `quality` that isn't 1-100;
+ *   "unable to capture screen" when the screenshot fails; an "unknown error" "tapwright shot: ..." when it can't
+ *   be encoded.
+ *
+ * Every route runs on the main queue (FBWebServer), and so do these: the main thread is busy while Vision
+ * reads (about 0.1-0.3 s "fast", 0.5-1.5 s "accurate" on a recent iPhone), or while a picture is encoded, and
+ * nothing else is answered meanwhile.
  *
  * Kept in this one file so the fork rebases cleanly onto upstream.
  */
@@ -45,6 +71,9 @@
 
 static const NSTimeInterval TWOcrShotTimeout = 10.0; // seconds the screenshot may take
 static const CGFloat TWOcrShotQuality = 0.8; // JPEG: smaller and quicker than PNG, and plenty for text
+static const NSInteger TWShotDefaultQuality = 70; // (version 11) of the picture sent, 1-100
+static const NSInteger TWShotMinWidth = 120; // pixels: the narrowest picture sent
+static const NSInteger TWShotRedrawnQuality = 80; // the least quality a screenshot that is redrawn is taken at
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -74,7 +103,198 @@ static NSNumber *TWOcrTenth(CGFloat value)
   @[
     [[FBRoute GET:@"/wda/tw/ocr"] respondWithTarget:self action:@selector(handleOcr:)],
     [[FBRoute GET:@"/wda/tw/ocr"].withoutSession respondWithTarget:self action:@selector(handleOcr:)],
+    [[FBRoute GET:@"/wda/tw/shot"] respondWithTarget:self action:@selector(handleShot:)],
+    [[FBRoute GET:@"/wda/tw/shot"].withoutSession respondWithTarget:self action:@selector(handleShot:)],
   ];
+}
+
+#pragma mark - The picture's parameters and size (pure, unit tested; version 11)
+
+/** A whole number from `min` to `max`, from a query string ("400") or a JSON number (400, not 400.5); nil for
+ *  anything else. */
++ (nullable NSNumber *)wholeNumberFrom:(nullable id)value min:(long long)min max:(long long)max
+{
+  long long number = 0;
+  if ([value isKindOfClass:NSString.class]) {
+    NSScanner *scanner = [NSScanner scannerWithString:(NSString *)value];
+    if (![scanner scanLongLong:&number] || !scanner.isAtEnd) {
+      return nil;
+    }
+  } else if ([value isKindOfClass:NSNumber.class]) {
+    double real = [(NSNumber *)value doubleValue];
+    if (!(isfinite(real) && real >= (double)min && real <= (double)max && real == floor(real))) {
+      return nil;
+    }
+    number = (long long)real;
+  } else {
+    return nil;
+  }
+  return (number >= min && number <= max) ? @(number) : nil;
+}
+
+/** The `width` parameter: 0 (the screenshot's own width) when absent, else a whole number of pixels from 1 (it is
+ *  clamped later, by +sentSizeOf:width:); nil when it is something else. */
++ (nullable NSNumber *)pictureWidthFrom:(nullable id)value
+{
+  return nil == value ? @0 : [self wholeNumberFrom:value min:1 max:(long long)INT_MAX];
+}
+
+/** The `quality` parameter: 70 when absent, else a whole number 1-100; nil when it is something else. */
++ (nullable NSNumber *)pictureQualityFrom:(nullable id)value
+{
+  return nil == value ? @(TWShotDefaultQuality) : [self wholeNumberFrom:value min:1 max:100];
+}
+
+/** The OCR read's `image`: NO when absent, "1"/"true" (any case) or the number 1 YES, "0"/"false" or 0 NO; nil for
+ *  anything else. */
++ (nullable NSNumber *)imageFlagFrom:(nullable id)value
+{
+  if (nil == value) {
+    return @NO;
+  }
+  if ([value isKindOfClass:NSString.class]) {
+    NSString *text = [(NSString *)value lowercaseString];
+    if ([text isEqualToString:@"1"] || [text isEqualToString:@"true"]) {
+      return @YES;
+    }
+    if ([text isEqualToString:@"0"] || [text isEqualToString:@"false"]) {
+      return @NO;
+    }
+    return nil;
+  }
+  NSNumber *number = [self wholeNumberFrom:value min:0 max:1];
+  if (nil == number) {
+    return nil;
+  }
+  return 1 == number.longLongValue ? @YES : @NO;
+}
+
+/** The pixel size of the picture sent for an upright screenshot of `upright` pixels: `width` (0: the screenshot's
+ *  own) clamped to 120..the screenshot's width, the height in the same proportion, rounded, at least 1. */
++ (CGSize)sentSizeOf:(CGSize)upright width:(NSInteger)width
+{
+  double fullWidth = round((double)upright.width);
+  double fullHeight = round((double)upright.height);
+  if (!(isfinite(fullWidth) && isfinite(fullHeight) && fullWidth >= 1 && fullHeight >= 1)) {
+    return CGSizeZero;
+  }
+  if (width <= 0) {
+    return CGSizeMake((CGFloat)fullWidth, (CGFloat)fullHeight);
+  }
+  double sentWidth = MIN(MAX((double)width, (double)TWShotMinWidth), fullWidth);
+  double sentHeight = MAX(round(fullHeight * sentWidth / fullWidth), 1.0);
+  return CGSizeMake((CGFloat)sentWidth, (CGFloat)sentHeight);
+}
+
+/** The quality (1-100) a screenshot is asked for: the picture's own when it is sent as taken (no `width`), else
+ *  at least TWShotRedrawnQuality, so that the picture is not made lossy twice at a low quality. */
++ (NSInteger)shotQualityFor:(NSInteger)quality width:(NSInteger)width
+{
+  return width <= 0 ? quality : MAX(quality, TWShotRedrawnQuality);
+}
+
+#pragma mark - The picture (version 11)
+
+/**
+ * The JPEG sent for the screenshot `image` (decoded from `data`, which the daemon encoded at `shotQuality`, 1-100):
+ * `data` itself when it is already upright, `size` pixels and of `quality`; else the picture drawn upright at
+ * `size` the way FBImageProcessor scales the MJPEG stream (UIGraphicsImageRenderer drawing the UIImage, whose
+ * imageOrientation, read from the screenshot's metadata, turns it upright), at one pixel per point so that `size`
+ * is in pixels, and encoded at `quality`. nil when it can't be made.
+ */
++ (nullable NSData *)jpegOf:(UIImage *)image
+                       data:(NSData *)data
+                shotQuality:(NSInteger)shotQuality
+                       size:(CGSize)size
+                    quality:(NSInteger)quality
+{
+  CGImageRef picture = image.CGImage;
+  if (NULL == picture || size.width < 1 || size.height < 1) {
+    return nil;
+  }
+  BOOL isAsTaken = UIImageOrientationUp == image.imageOrientation
+    && (size_t)size.width == CGImageGetWidth(picture)
+    && (size_t)size.height == CGImageGetHeight(picture)
+    && shotQuality == quality;
+  if (isAsTaken) {
+    return data;
+  }
+  UIGraphicsImageRendererFormat *format = [[UIGraphicsImageRendererFormat alloc] init];
+  format.scale = 1;
+  format.opaque = YES;
+  format.preferredRange = UIGraphicsImageRendererFormatRangeStandard; // 8 bits a channel: JPEG has no more
+  UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size format:format];
+  return [renderer JPEGDataWithCompressionQuality:(CGFloat)quality / 100
+                                          actions:^(UIGraphicsImageRendererContext * _Nonnull context) {
+    [image drawInRect:CGRectMake(0, 0, size.width, size.height)];
+  }];
+}
+
++ (id<FBResponsePayload>)handleShot:(FBRouteRequest *)request
+{
+  NSNumber *width = [self pictureWidthFrom:request.parameters[@"width"]];
+  if (nil == width) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"width must be a whole number of pixels (it is clamped to 120..the screen's width)"
+                                                                       traceback:nil]);
+  }
+  NSNumber *quality = [self pictureQualityFrom:request.parameters[@"quality"]];
+  if (nil == quality) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"quality must be a whole number from 1 to 100"
+                                                                       traceback:nil]);
+  }
+
+  NSError *error = nil;
+  XCUIScreen *screen = [FBScreen currentScreenWithError:&error];
+  if (nil == screen) {
+    return FBResponseWithStatus([FBCommandStatus unableToCaptureScreenErrorWithMessage:error.localizedDescription ?: @"the screen can't be told"
+                                                                             traceback:nil]);
+  }
+  NSInteger shotQuality = [self shotQualityFor:quality.integerValue width:width.integerValue];
+  NSTimeInterval began = NSProcessInfo.processInfo.systemUptime;
+  NSData *data = [FBScreenshot takeInOriginalResolutionWithScreenID:screen.displayID
+                                                 compressionQuality:(CGFloat)shotQuality / 100
+                                                                uti:UTTypeJPEG
+                                                            timeout:TWOcrShotTimeout
+                                                              error:&error];
+  NSTimeInterval shot = NSProcessInfo.processInfo.systemUptime;
+  UIImage *image = nil == data ? nil : [UIImage imageWithData:(NSData *)data];
+  CGImageRef picture = image.CGImage;
+  if (nil == image || NULL == picture) {
+    return FBResponseWithStatus([FBCommandStatus unableToCaptureScreenErrorWithMessage:error.localizedDescription ?: @"the screenshot could not be read"
+                                                                             traceback:nil]);
+  }
+
+  CGSize pixels = CGSizeMake((CGFloat)CGImageGetWidth(picture), (CGFloat)CGImageGetHeight(picture));
+  CGSize upright = [self uprightSizeOf:pixels orientation:image.imageOrientation];
+  CGSize points = [self pointSizeOf:upright scale:screen.scale];
+  CGSize size = [self sentSizeOf:upright width:width.integerValue];
+  NSData *jpeg = [self jpegOf:(UIImage *)image
+                         data:(NSData *)data
+                  shotQuality:shotQuality
+                         size:size
+                      quality:quality.integerValue];
+  NSString *encoded = [jpeg base64EncodedStringWithOptions:0];
+  NSTimeInterval done = NSProcessInfo.processInfo.systemUptime;
+  if (nil == encoded) {
+    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"tapwright shot: the picture could not be encoded"
+                                                               traceback:nil]);
+  }
+  return FBResponseWithObject(@{
+    @"jpeg": (NSString *)encoded,
+    @"size": @[@((NSInteger)size.width), @((NSInteger)size.height)],
+    @"screen": @[TWOcrTenth(points.width), TWOcrTenth(points.height)],
+    @"ms": @{@"shot": TWOcrMilliseconds(began, shot), @"encode": TWOcrMilliseconds(shot, done)},
+  });
+}
+
+/** The upright screenshot's size in points: pixels / the screen's scale (1 when the scale isn't a positive
+ *  number). */
++ (CGSize)pointSizeOf:(CGSize)upright scale:(double)scale
+{
+  if (!(isfinite(scale) && scale > 0)) {
+    scale = 1;
+  }
+  return CGSizeMake((CGFloat)((double)upright.width / scale), (CGFloat)((double)upright.height / scale));
 }
 
 #pragma mark - Geometry (pure, unit tested)
@@ -170,8 +390,32 @@ static NSNumber *TWOcrTenth(CGFloat value)
     return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"languages must be comma-separated language codes, e.g. en-US,ar-SA"
                                                                        traceback:nil]);
   }
+  // (version 11) the picture the text is read from, only when asked; `width` and `quality` only matter then
+  NSNumber *wantsImage = [self imageFlagFrom:request.parameters[@"image"]];
+  if (nil == wantsImage) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"image must be 1 or 0"
+                                                                       traceback:nil]);
+  }
+  NSNumber *width = @0;
+  NSNumber *quality = @(TWShotDefaultQuality);
+  if (wantsImage.boolValue) {
+    width = [self pictureWidthFrom:request.parameters[@"width"]];
+    if (nil == width) {
+      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"width must be a whole number of pixels (it is clamped to 120..the screen's width)"
+                                                                         traceback:nil]);
+    }
+    quality = [self pictureQualityFrom:request.parameters[@"quality"]];
+    if (nil == quality) {
+      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"quality must be a whole number from 1 to 100"
+                                                                         traceback:nil]);
+    }
+  }
   if (@available(iOS 13.0, *)) {
-    return [self readWithFastLevel:isFast languages:languages];
+    return [self readWithFastLevel:isFast
+                         languages:languages
+                        wantsImage:wantsImage.boolValue
+                             width:width.integerValue
+                           quality:quality.integerValue];
   }
   return FBResponseWithStatus([FBCommandStatus unsupportedOperationErrorWithMessage:@"tapwright ocr: text recognition needs iOS 13 or later"
                                                                           traceback:nil]);
@@ -179,6 +423,9 @@ static NSNumber *TWOcrTenth(CGFloat value)
 
 + (id<FBResponsePayload>)readWithFastLevel:(BOOL)isFast
                                  languages:(nullable NSArray<NSString *> *)languages
+                                wantsImage:(BOOL)wantsImage
+                                     width:(NSInteger)width
+                                   quality:(NSInteger)quality
 {
   // (only called behind @available(iOS 13.0, *); the deployment target is iOS 15 anyway)
   NSError *error = nil;
@@ -261,11 +508,38 @@ static NSNumber *TWOcrTenth(CGFloat value)
     return NSOrderedSame == byTop ? [a[0] compare:b[0]] : byTop;
   }];
 
+  if (!wantsImage) {
+    // exactly the version 10 answer
+    return FBResponseWithObject(@{
+      @"screen": @[TWOcrTenth(points.width), TWOcrTenth(points.height)],
+      @"ms": @{@"shot": TWOcrMilliseconds(began, shot), @"ocr": TWOcrMilliseconds(shot, read)},
+      @"level": isFast ? @"fast" : @"accurate",
+      @"lines": lines.copy,
+    });
+  }
+
+  // (version 11) the very screenshot Vision read, sent as GET /wda/tw/shot sends its picture
+  NSTimeInterval encoding = NSProcessInfo.processInfo.systemUptime;
+  CGSize size = [self sentSizeOf:upright width:width];
+  NSData *jpeg = [self jpegOf:(UIImage *)image
+                         data:(NSData *)data
+                  shotQuality:(NSInteger)round(TWOcrShotQuality * 100)
+                         size:size
+                      quality:quality];
+  NSString *encoded = [jpeg base64EncodedStringWithOptions:0];
+  NSTimeInterval done = NSProcessInfo.processInfo.systemUptime;
+  if (nil == encoded) {
+    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"tapwright ocr: the picture could not be encoded"
+                                                               traceback:nil]);
+  }
   return FBResponseWithObject(@{
     @"screen": @[TWOcrTenth(points.width), TWOcrTenth(points.height)],
-    @"ms": @{@"shot": TWOcrMilliseconds(began, shot), @"ocr": TWOcrMilliseconds(shot, read)},
+    @"ms": @{@"shot": TWOcrMilliseconds(began, shot), @"ocr": TWOcrMilliseconds(shot, read),
+             @"encode": TWOcrMilliseconds(encoding, done)},
     @"level": isFast ? @"fast" : @"accurate",
     @"lines": lines.copy,
+    @"jpeg": (NSString *)encoded,
+    @"size": @[@((NSInteger)size.width), @((NSInteger)size.height)],
   });
 }
 

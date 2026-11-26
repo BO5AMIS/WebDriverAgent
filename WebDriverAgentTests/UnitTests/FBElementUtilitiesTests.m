@@ -41,6 +41,13 @@
 + (CGImagePropertyOrientation)propertyOrientationOf:(UIImageOrientation)orientation;
 + (CGSize)uprightSizeOf:(CGSize)size orientation:(UIImageOrientation)orientation;
 + (CGRect)screenRectOfNormalizedBox:(CGRect)box inSize:(CGSize)size;
+// route version 11: the picture's parameters and size
++ (nullable NSNumber *)pictureWidthFrom:(nullable id)value;
++ (nullable NSNumber *)pictureQualityFrom:(nullable id)value;
++ (nullable NSNumber *)imageFlagFrom:(nullable id)value;
++ (CGSize)sentSizeOf:(CGSize)upright width:(NSInteger)width;
++ (NSInteger)shotQualityFor:(NSInteger)quality width:(NSInteger)width;
++ (CGSize)pointSizeOf:(CGSize)upright scale:(double)scale;
 @end
 
 // Private Tapwright command methods, exercised with synthetic AX identities only.
@@ -312,6 +319,81 @@ static TWHitSnapshotDouble *TWSnapshot(id element)
                  (NSInteger)kCGImagePropertyOrientationLeft);
   XCTAssertEqual((NSInteger)[TWOcrCommands propertyOrientationOf:UIImageOrientationDown],
                  (NSInteger)kCGImagePropertyOrientationDown);
+}
+
+- (void)testShotParametersAreParsed
+{
+  XCTAssertEqualObjects([TWOcrCommands pictureWidthFrom:nil], @0);
+  XCTAssertEqualObjects([TWOcrCommands pictureWidthFrom:@"400"], @400);
+  XCTAssertEqualObjects([TWOcrCommands pictureWidthFrom:@(400)], @400);
+  XCTAssertEqualObjects([TWOcrCommands pictureWidthFrom:@"1"], @1);
+  XCTAssertNil([TWOcrCommands pictureWidthFrom:@"0"]);
+  XCTAssertNil([TWOcrCommands pictureWidthFrom:@"-5"]);
+  XCTAssertNil([TWOcrCommands pictureWidthFrom:@"400.5"]);
+  XCTAssertNil([TWOcrCommands pictureWidthFrom:@(400.5)]);
+  XCTAssertNil([TWOcrCommands pictureWidthFrom:@"400px"]);
+  XCTAssertNil([TWOcrCommands pictureWidthFrom:@""]);
+  XCTAssertNil([TWOcrCommands pictureWidthFrom:@[]]);
+
+  XCTAssertEqualObjects([TWOcrCommands pictureQualityFrom:nil], @70);
+  XCTAssertEqualObjects([TWOcrCommands pictureQualityFrom:@"1"], @1);
+  XCTAssertEqualObjects([TWOcrCommands pictureQualityFrom:@"100"], @100);
+  XCTAssertEqualObjects([TWOcrCommands pictureQualityFrom:@(55)], @55);
+  XCTAssertNil([TWOcrCommands pictureQualityFrom:@"0"]);
+  XCTAssertNil([TWOcrCommands pictureQualityFrom:@"101"]);
+  XCTAssertNil([TWOcrCommands pictureQualityFrom:@"0.7"]);
+  XCTAssertNil([TWOcrCommands pictureQualityFrom:@"high"]);
+
+  XCTAssertEqualObjects([TWOcrCommands imageFlagFrom:nil], @NO);
+  XCTAssertEqualObjects([TWOcrCommands imageFlagFrom:@"1"], @YES);
+  XCTAssertEqualObjects([TWOcrCommands imageFlagFrom:@"TRUE"], @YES);
+  XCTAssertEqualObjects([TWOcrCommands imageFlagFrom:@"0"], @NO);
+  XCTAssertEqualObjects([TWOcrCommands imageFlagFrom:@"false"], @NO);
+  XCTAssertEqualObjects([TWOcrCommands imageFlagFrom:@(1)], @YES);
+  XCTAssertEqualObjects([TWOcrCommands imageFlagFrom:@(0)], @NO);
+  XCTAssertNil([TWOcrCommands imageFlagFrom:@"yes"]);
+  XCTAssertNil([TWOcrCommands imageFlagFrom:@"2"]);
+  XCTAssertNil([TWOcrCommands imageFlagFrom:@(2)]);
+
+  // a picture sent as taken keeps its quality; a redrawn one is taken at 80 or more
+  XCTAssertEqual([TWOcrCommands shotQualityFor:70 width:0], 70);
+  XCTAssertEqual([TWOcrCommands shotQualityFor:30 width:0], 30);
+  XCTAssertEqual([TWOcrCommands shotQualityFor:70 width:400], 80);
+  XCTAssertEqual([TWOcrCommands shotQualityFor:95 width:400], 95);
+}
+
+- (void)testShotSizeIsClampedAndProportional
+{
+  CGSize portrait = CGSizeMake(1290, 2796);
+  CGSize original = [TWOcrCommands sentSizeOf:portrait width:0];
+  XCTAssertEqualWithAccuracy(original.width, 1290.0, 1e-9);
+  XCTAssertEqualWithAccuracy(original.height, 2796.0, 1e-9);
+  CGSize scaled = [TWOcrCommands sentSizeOf:portrait width:400]; // 2796 * 400 / 1290 = 866.98
+  XCTAssertEqualWithAccuracy(scaled.width, 400.0, 1e-9);
+  XCTAssertEqualWithAccuracy(scaled.height, 867.0, 1e-9);
+  CGSize narrowest = [TWOcrCommands sentSizeOf:portrait width:50]; // clamped to 120: 2796 * 120 / 1290 = 260.09
+  XCTAssertEqualWithAccuracy(narrowest.width, 120.0, 1e-9);
+  XCTAssertEqualWithAccuracy(narrowest.height, 260.0, 1e-9);
+  CGSize widest = [TWOcrCommands sentSizeOf:portrait width:5000];
+  XCTAssertEqualWithAccuracy(widest.width, 1290.0, 1e-9);
+  XCTAssertEqualWithAccuracy(widest.height, 2796.0, 1e-9);
+  CGSize landscape = [TWOcrCommands sentSizeOf:CGSizeMake(2796, 1290) width:400]; // 1290 * 400 / 2796 = 184.55
+  XCTAssertEqualWithAccuracy(landscape.width, 400.0, 1e-9);
+  XCTAssertEqualWithAccuracy(landscape.height, 185.0, 1e-9);
+  // a picture narrower than 120 pixels is never made wider
+  CGSize tiny = [TWOcrCommands sentSizeOf:CGSizeMake(100, 200) width:400];
+  XCTAssertEqualWithAccuracy(tiny.width, 100.0, 1e-9);
+  XCTAssertEqualWithAccuracy(tiny.height, 200.0, 1e-9);
+  CGSize empty = [TWOcrCommands sentSizeOf:CGSizeZero width:400];
+  XCTAssertEqualWithAccuracy(empty.width, 0.0, 1e-9);
+  XCTAssertEqualWithAccuracy(empty.height, 0.0, 1e-9);
+
+  CGSize points = [TWOcrCommands pointSizeOf:portrait scale:3];
+  XCTAssertEqualWithAccuracy(points.width, 430.0, 1e-9);
+  XCTAssertEqualWithAccuracy(points.height, 932.0, 1e-9);
+  CGSize unscaled = [TWOcrCommands pointSizeOf:CGSizeMake(320, 480) scale:0];
+  XCTAssertEqualWithAccuracy(unscaled.width, 320.0, 1e-9);
+  XCTAssertEqualWithAccuracy(unscaled.height, 480.0, 1e-9);
 }
 
 - (void)testStabilityWaitRestoresSettingsAfterAnException

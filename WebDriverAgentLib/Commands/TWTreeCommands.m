@@ -98,9 +98,18 @@
  *   UIScreen: on a device the runner app is letterboxed (droidrun saw 320x480), so UIScreen.mainScreen.bounds is
  *   not the screen.
  *
+ * GET /wda/tw/front   (and GET /session/:sessionId/wda/tw/front)   (version 11)
+ *   The application in front, found exactly as the tree read finds it before its first tier, and nothing more: no
+ *   snapshot, no element query, no idle wait, nothing that reads an app's elements:
+ *     {"b": "<bundle id>", "pid": n, "ms": n}
+ *   `b` and `pid` are left out when they can't be told (`b` also when XCTest names it "unknown"); `ms` is how long
+ *   finding it took. Meant to answer in milliseconds also on a screen whose app never answers accessibility reads
+ *   (GET /wda/activeAppInfo reads the app's identifier, which waits on the app). See +handleFront: for why none of
+ *   its calls can wait on the app.
+ *
  * GET /wda/tw/version answers 4 from this version on, 5 once "f" is sent (see TWFastTapCommands.m), 9 once the tree
  * is bounded and the screen and OCR routes exist, 10 once `attrs`, `arraycap`, `modal`, `ms.request`, `ms.attrs` and
- * GET /wda/tw/attrs exist.
+ * GET /wda/tw/attrs exist, 11 once GET /wda/tw/front, GET /wda/tw/shot and the OCR route's `image` exist.
  *
  * Kept in this one file so the fork rebases cleanly onto upstream.
  */
@@ -146,6 +155,7 @@ static const NSTimeInterval TWTreeMinTier = 0.25; // seconds a tier needs to be 
 static const int TWShallowDepth = 15;
 static const int TWShallowChildren = 20;
 static const NSUInteger TWWhyLength = 300; // characters of "why" at most
+static const NSTimeInterval TWFrontAXTimeout = 0.5; // seconds GET /wda/tw/front gives its accessibility lookup
 static NSString *const TWTierFull = @"full";
 static NSString *const TWTierShallow = @"shallow";
 static NSString *const TWTierRoot = @"root";
@@ -320,6 +330,8 @@ static NSArray<NSString *> *TWStringsIn(id _Nullable value)
     [[FBRoute GET:@"/wda/tw/screen"].withoutSession respondWithTarget:self action:@selector(handleScreen:)],
     [[FBRoute GET:@"/wda/tw/attrs"] respondWithTarget:self action:@selector(handleAttrs:)],
     [[FBRoute GET:@"/wda/tw/attrs"].withoutSession respondWithTarget:self action:@selector(handleAttrs:)],
+    [[FBRoute GET:@"/wda/tw/front"] respondWithTarget:self action:@selector(handleFront:)],
+    [[FBRoute GET:@"/wda/tw/front"].withoutSession respondWithTarget:self action:@selector(handleFront:)],
   ];
 }
 
@@ -533,15 +545,10 @@ static NSArray<NSString *> *TWStringsIn(id _Nullable value)
   NSTimeInterval fullEnd = began + [self fullShareOf:budget];
 
   // the application /source reads (FBDebugCommands.m), found before the first tier so that "root" can name it
-  __block XCUIApplication *application = nil;
-  __block NSString *appFailure = nil;
-  [[FBXCAXClientProxy sharedClient] withAXTimeout:MAX(fullEnd - TWNow(), TWTreeMinTier) do:^{
-    @try {
-      application = request.session.activeApplication ?: XCUIApplication.fb_activeApplication;
-    } @catch (NSException *e) {
-      appFailure = e.reason ?: e.name;
-    }
-  } error:nil];
+  NSString *appFailure = nil;
+  XCUIApplication *application = [self frontApplicationFor:request
+                                                    within:MAX(fullEnd - TWNow(), TWTreeMinTier)
+                                                   failure:&appFailure];
   if (nil == application) {
     [why addObject:[NSString stringWithFormat:@"app: %@", appFailure ?: @"the application in front could not be told"]];
   }
@@ -944,6 +951,106 @@ static NSArray<NSString *> *TWStringsIn(id _Nullable value)
   }
 }
 
+#pragma mark - The application in front (version 11: shared by the tree read and GET /wda/tw/front)
+
+/**
+ * The application /source reads (FBDebugCommands.m): the session's active application, else XCTest's active one,
+ * looked up inside -[FBXCAXClientProxy withAXTimeout:do:error:] so that its accessibility calls wait `timeout`
+ * seconds at most. nil, with `failure` set when the lookup raised, when it can't be told.
+ */
++ (nullable XCUIApplication *)frontApplicationFor:(FBRouteRequest *)request
+                                           within:(NSTimeInterval)timeout
+                                          failure:(NSString * _Nullable __autoreleasing *)failure
+{
+  __block XCUIApplication *application = nil;
+  __block NSString *problem = nil;
+  [[FBXCAXClientProxy sharedClient] withAXTimeout:timeout do:^{
+    @try {
+      application = request.session.activeApplication ?: XCUIApplication.fb_activeApplication;
+    } @catch (NSException *e) {
+      problem = e.reason ?: e.name;
+    }
+  } error:nil];
+  if (NULL != failure) {
+    *failure = problem;
+  }
+  return application;
+}
+
+/**
+ * The process id of `application` (0 when it can't be told), and its bundle id into `bundle` (nil when it can't
+ * be told, is empty or is FBUnknownBundleId's "unknown"). Both come from XCTest's process tracker, no
+ * accessibility question. Without an application: from the element XCTest's daemon names at WDA's active app
+ * detection point (at most 0.3 s), then the tracker, then the daemon's bundle id for that process (at most 1 s).
+ */
++ (int)processOf:(nullable XCUIApplication *)application bundle:(NSString * _Nullable __autoreleasing *)bundle
+{
+  int pid = 0;
+  NSString *named = nil;
+  @try {
+    if (nil != application) {
+      pid = application.processID;
+      named = application.bundleID;
+    } else {
+      id<FBXCAccessibilityElement> element = FBActiveAppDetectionPoint.sharedInstance.axElement;
+      pid = nil == element ? 0 : element.processIdentifier;
+      if (pid > 0) {
+        XCUIApplication *app = [[FBXCAXClientProxy sharedClient] monitoredApplicationWithProcessIdentifier:pid];
+        named = app.bundleID;
+        if (0 == named.length) {
+          NSDictionary *info = [XCUIApplication fb_appsInfoWithAxElements:@[(id<FBXCAccessibilityElement>)element]].firstObject;
+          id told = info[@"bundleId"];
+          named = [told isKindOfClass:NSString.class] ? (NSString *)told : nil;
+        }
+      }
+    }
+  } @catch (NSException *e) {
+    [FBLogger logFmt:@"Tapwright tree: the application can't be named: %@", e.reason ?: e.name];
+  }
+  if (NULL != bundle) {
+    // FBUnknownBundleId and empty strings are not a bundle id
+    *bundle = (named.length > 0 && ![named isEqualToString:@"unknown"]) ? named : nil;
+  }
+  return pid;
+}
+
+/**
+ * GET /wda/tw/front: the application in front, as the tree read finds it before its first tier.
+ *
+ * Why none of its calls can wait on the app in front (or on any app's elements):
+ * - The session's -activeApplication, for a session started without an app (Tapwright's: POST /session with empty
+ *   capabilities, defaultActiveApplication "auto"), is +fb_activeApplicationWithDefaultBundleId:nil. (A session
+ *   started with an app under test and shouldRespectSystemAlerts on would also ask SpringBoard whether it shows an
+ *   alert: an element query of SpringBoard, not of the app in front, bounded by the AX timeout below.)
+ * - That asks XCAXClient_iOS for the active applications: one request to the accessibility server for the list of
+ *   application elements, not for anything inside an app, bounded by the AX timeout (TWFrontAXTimeout, 0.5 s) set
+ *   with -withAXTimeout:do:error:. When there is more than one, it asks XCTest's daemon which element is at WDA's
+ *   detection point (_XCT_requestElementAtPoint:, whose answer is waited for 0.3 s at most).
+ * - The XCUIApplication comes from XCTest's process tracker (-monitoredApplicationWithProcessIdentifier:), and its
+ *   processID and bundleID are properties of that tracker's process record: no accessibility request. Nothing here
+ *   reads `identifier`, `label` or any other element attribute, which is what makes GET /wda/activeAppInfo wait.
+ * - Only when no application could be had at all: the daemon at the detection point again (0.3 s at most) and the
+ *   daemon's bundle id for that process id (_XCT_requestBundleIDForPID:, 1 s at most).
+ * No snapshot, no idle wait, no quiescence wait. Worst case is about 0.5 + 0.3 + 1 s, not the app's own pace; the
+ * usual case is a few milliseconds (the tree read's ms.app: 5-9 ms with TikTok's feed in front).
+ */
++ (id<FBResponsePayload>)handleFront:(FBRouteRequest *)request
+{
+  NSTimeInterval began = TWNow();
+  XCUIApplication *application = [self frontApplicationFor:request within:TWFrontAXTimeout failure:nil];
+  NSString *bundle = nil;
+  int pid = [self processOf:application bundle:&bundle];
+  NSTimeInterval told = TWNow();
+
+  NSMutableDictionary *answer = [NSMutableDictionary dictionaryWithCapacity:3];
+  if (pid > 0) {
+    answer[@"pid"] = @(pid);
+    answer[@"b"] = bundle; // nil leaves it out
+  }
+  answer[@"ms"] = TWTreeMilliseconds(began, told);
+  return FBResponseWithObject(answer.copy);
+}
+
 /**
  * The "root" tier's node: the application alone, with the screen's frame, found without a snapshot. Its process
  * id and bundle id come from the application found before the tiers (XCTest's process tracker, no accessibility
@@ -953,28 +1060,8 @@ static NSArray<NSString *> *TWStringsIn(id _Nullable value)
                         wait:(NSTimeInterval)wait
                      context:(CC_SHA256_CTX *)context
 {
-  int pid = 0;
   NSString *bundle = nil;
-  @try {
-    if (nil != application) {
-      pid = application.processID;
-      bundle = application.bundleID;
-    } else {
-      id<FBXCAccessibilityElement> element = FBActiveAppDetectionPoint.sharedInstance.axElement;
-      pid = nil == element ? 0 : element.processIdentifier;
-      if (pid > 0) {
-        XCUIApplication *app = [[FBXCAXClientProxy sharedClient] monitoredApplicationWithProcessIdentifier:pid];
-        bundle = app.bundleID;
-        if (0 == bundle.length) {
-          NSDictionary *info = [XCUIApplication fb_appsInfoWithAxElements:@[(id<FBXCAccessibilityElement>)element]].firstObject;
-          id named = info[@"bundleId"];
-          bundle = [named isKindOfClass:NSString.class] ? (NSString *)named : nil;
-        }
-      }
-    }
-  } @catch (NSException *e) {
-    [FBLogger logFmt:@"Tapwright tree: the application can't be named: %@", e.reason ?: e.name];
-  }
+  int pid = [self processOf:application bundle:&bundle];
 
   NSMutableDictionary *node = [NSMutableDictionary dictionaryWithCapacity:4];
   NSString *type = [FBElementTypeTransformer shortStringWithElementType:XCUIElementTypeApplication];
