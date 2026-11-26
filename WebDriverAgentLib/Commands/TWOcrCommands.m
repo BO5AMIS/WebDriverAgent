@@ -467,23 +467,43 @@ static NSNumber *TWOcrTenth(CGFloat value)
   // reads that picture as it is. Told the screenshot's orientation instead, Vision found the text in the right
   // places but read it upside down in both landscape turns (iPhone 14 Pro Max, iOS 26.5: Calculator's "789" came
   // back as "68L"). Only a turned screenshot pays for the drawing.
+  // (version 13) Version 12's drawing fixed one landscape turn and not the other (the same pixels on screen). Now
+  // the upright picture is made as the one that is sent (a JPEG drawn by jpegOf, proven upright in both turns by
+  // reading it on a computer) and decoded again, so Vision reads those very pixels, with no orientation to be told.
+  // `turn` in the answer says what the screenshot's orientation was and how it was read (0 as taken, 1 from the
+  // upright JPEG, 2 from the drawing when that JPEG couldn't be made).
   CGImageRef toRead = picture;
   CGImagePropertyOrientation toldOrientation = [self propertyOrientationOf:imageOrientation];
   UIImage *turned = nil;
+  NSInteger howRead = 0;
   if (UIImageOrientationUp != imageOrientation && upright.width >= 1 && upright.height >= 1) {
-    UIGraphicsImageRendererFormat *format = [[UIGraphicsImageRendererFormat alloc] init];
-    format.scale = 1;
-    format.opaque = YES;
-    format.preferredRange = UIGraphicsImageRendererFormatRangeStandard;
-    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:upright format:format];
-    turned = [renderer imageWithActions:^(UIGraphicsImageRendererContext * _Nonnull context) {
-      [image drawInRect:CGRectMake(0, 0, upright.width, upright.height)];
-    }];
-    if (NULL != turned.CGImage) {
+    NSData *uprightData = [self jpegOf:(UIImage *)image
+                                  data:(NSData *)data
+                           shotQuality:-1
+                                  size:upright
+                               quality:92];
+    turned = nil == uprightData ? nil : [UIImage imageWithData:(NSData *)uprightData];
+    if (NULL != turned.CGImage && UIImageOrientationUp == turned.imageOrientation) {
       toRead = turned.CGImage;
       toldOrientation = kCGImagePropertyOrientationUp;
+      howRead = 1;
+    } else {
+      UIGraphicsImageRendererFormat *format = [[UIGraphicsImageRendererFormat alloc] init];
+      format.scale = 1;
+      format.opaque = YES;
+      format.preferredRange = UIGraphicsImageRendererFormatRangeStandard;
+      UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:upright format:format];
+      turned = [renderer imageWithActions:^(UIGraphicsImageRendererContext * _Nonnull context) {
+        [image drawInRect:CGRectMake(0, 0, upright.width, upright.height)];
+      }];
+      if (NULL != turned.CGImage) {
+        toRead = turned.CGImage;
+        toldOrientation = kCGImagePropertyOrientationUp;
+        howRead = 2;
+      }
     }
   }
+  NSArray<NSNumber *> *turn = @[@((NSInteger)imageOrientation), @(howRead)];
   VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:toRead
                                                                       orientation:toldOrientation
                                                                           options:@{}];
@@ -536,6 +556,7 @@ static NSNumber *TWOcrTenth(CGFloat value)
       @"ms": @{@"shot": TWOcrMilliseconds(began, shot), @"ocr": TWOcrMilliseconds(shot, read)},
       @"level": isFast ? @"fast" : @"accurate",
       @"lines": lines.copy,
+      @"turn": turn,
     });
   }
 
@@ -557,6 +578,7 @@ static NSNumber *TWOcrTenth(CGFloat value)
     @"screen": @[TWOcrTenth(points.width), TWOcrTenth(points.height)],
     @"ms": @{@"shot": TWOcrMilliseconds(began, shot), @"ocr": TWOcrMilliseconds(shot, read),
              @"encode": TWOcrMilliseconds(encoding, done)},
+    @"turn": turn,
     @"level": isFast ? @"fast" : @"accurate",
     @"lines": lines.copy,
     @"jpeg": (NSString *)encoded,
