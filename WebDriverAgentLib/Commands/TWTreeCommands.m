@@ -967,6 +967,14 @@ static NSArray<NSString *> *TWStringsIn(id _Nullable value)
   [[FBXCAXClientProxy sharedClient] withAXTimeout:timeout do:^{
     @try {
       application = request.session.activeApplication ?: XCUIApplication.fb_activeApplication;
+      // (version 15) WebDriverAgent names the app in front by the element at its detection point. On a home screen
+      // page with an interactive widget at that point the element is the widget's, drawn by a WidgetRenderer process
+      // (com.apple.chrono.WidgetRenderer-Default) whose accessibility never answers: the app in front was that
+      // process, and the home screen read as a screen with no elements (iPhone 14 Pro Max, iOS 26.5, 2026-11-26,
+      // when a Smart Stack turned to the Fitness widget). A widget is never the app in front: SpringBoard is.
+      if ([self isWidgetHost:application.bundleID]) {
+        application = XCUIApplication.fb_systemApplication;
+      }
     } @catch (NSException *e) {
       problem = e.reason ?: e.name;
     }
@@ -975,6 +983,12 @@ static NSArray<NSString *> *TWStringsIn(id _Nullable value)
     *failure = problem;
   }
   return application;
+}
+
+/** Is this the bundle id of a process that only draws widgets (chronod's renderers)? Never an app in front. */
++ (BOOL)isWidgetHost:(nullable NSString *)bundle
+{
+  return nil != bundle && [bundle hasPrefix:@"com.apple.chrono."];
 }
 
 /**

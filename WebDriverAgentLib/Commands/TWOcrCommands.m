@@ -490,7 +490,9 @@ static NSNumber *TWOcrTenth(CGFloat value)
   // upright JPEG, 2 from the drawing when that JPEG couldn't be made).
   CGImageRef toRead = picture;
   CGImagePropertyOrientation toldOrientation = [self propertyOrientationOf:imageOrientation];
-  UIImage *turned = nil;
+  // (version 15) kept alive to the end of the method by declaration: Vision reads its CGImage twice, and ARC may
+  // otherwise let a local go after its last use
+  __attribute__((objc_precise_lifetime)) UIImage *turned = nil;
   NSInteger howRead = 0;
   if (UIImageOrientationUp != imageOrientation && upright.width >= 1 && upright.height >= 1) {
     NSData *uprightData = [self jpegOf:(UIImage *)image
