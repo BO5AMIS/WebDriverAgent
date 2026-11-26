@@ -297,6 +297,22 @@ static NSNumber *TWOcrTenth(CGFloat value)
   return CGSizeMake((CGFloat)((double)upright.width / scale), (CGFloat)((double)upright.height / scale));
 }
 
+/** How much Vision trusts a reading: each line's confidence times its length, summed. */
++ (double)scoreOfResults:(nullable NSArray *)results
+{
+  double score = 0;
+  for (id result in results) {
+    if (![result isKindOfClass:VNRecognizedTextObservation.class]) {
+      continue;
+    }
+    VNRecognizedText *best = [(VNRecognizedTextObservation *)result topCandidates:1].firstObject;
+    if (nil != best) {
+      score += (double)best.confidence * (double)best.string.length;
+    }
+  }
+  return score;
+}
+
 #pragma mark - Geometry (pure, unit tested)
 
 /** The orientation Vision is told for a picture UIKit shows with `orientation` (the same numbering as EXIF's). */
@@ -503,7 +519,6 @@ static NSNumber *TWOcrTenth(CGFloat value)
       }
     }
   }
-  NSArray<NSNumber *> *turn = @[@((NSInteger)imageOrientation), @(howRead)];
   VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:toRead
                                                                       orientation:toldOrientation
                                                                           options:@{}];
@@ -523,8 +538,46 @@ static NSNumber *TWOcrTenth(CGFloat value)
                                                                traceback:nil]);
   }
 
-  NSMutableArray<NSDictionary *> *lines = [NSMutableArray array];
+  // (version 14) With the screen in landscape Vision sometimes reads an upright picture upside down, glyph by glyph
+  // ("789" as "68L", the boxes in their right places), and sometimes reads it right: versions 12 and 13 gave it the
+  // same upright pixels and got both (iPhone 14 Pro Max, iOS 26.5, 2026-11-26). So a turned screen is read a second
+  // time with the picture told to be upside down, and the reading that Vision itself trusts more (confidence times
+  // length, summed) is kept; its boxes are turned back. `turn` says: the screenshot's orientation, how the picture
+  // was made (0 as taken, 1 from the upright JPEG, 2 from the drawing), whether the second reading won, and both
+  // readings' scores.
   NSArray *results = recognition.results;
+  BOOL isFlipped = NO;
+  double firstScore = [self scoreOfResults:results];
+  double secondScore = -1;
+  if (0 != howRead) {
+    VNRecognizeTextRequest *again = [[VNRecognizeTextRequest alloc] init];
+    again.recognitionLevel = recognition.recognitionLevel;
+    again.usesLanguageCorrection = recognition.usesLanguageCorrection;
+    if (nil != languages) {
+      again.recognitionLanguages = (NSArray<NSString *> *)languages;
+    }
+    VNImageRequestHandler *other = [[VNImageRequestHandler alloc] initWithCGImage:toRead
+                                                                    orientation:kCGImagePropertyOrientationDown
+                                                                        options:@{}];
+    BOOL isReadAgain = NO;
+    @try {
+      isReadAgain = [other performRequests:@[again] error:nil];
+    } @catch (NSException *e) {
+      isReadAgain = NO;
+    }
+    if (isReadAgain) {
+      secondScore = [self scoreOfResults:again.results];
+      if (secondScore > firstScore) {
+        results = again.results;
+        isFlipped = YES;
+      }
+    }
+    read = NSProcessInfo.processInfo.systemUptime;
+  }
+  NSArray<NSNumber *> *turn = @[@((NSInteger)imageOrientation), @(howRead), @(isFlipped),
+                                @(round(firstScore * 10) / 10), @(round(secondScore * 10) / 10)];
+
+  NSMutableArray<NSDictionary *> *lines = [NSMutableArray array];
   for (id result in results) {
     if (![result isKindOfClass:VNRecognizedTextObservation.class]) {
       continue;
@@ -534,7 +587,12 @@ static NSNumber *TWOcrTenth(CGFloat value)
     if (nil == best || 0 == best.string.length) {
       continue;
     }
-    CGRect rect = [self screenRectOfNormalizedBox:observation.boundingBox inSize:points];
+    CGRect box = observation.boundingBox;
+    if (isFlipped) {
+      box = CGRectMake(1 - box.origin.x - box.size.width, 1 - box.origin.y - box.size.height,
+                       box.size.width, box.size.height);
+    }
+    CGRect rect = [self screenRectOfNormalizedBox:box inSize:points];
     [lines addObject:@{
       @"text": best.string,
       @"rect": @[TWOcrTenth(rect.origin.x), TWOcrTenth(rect.origin.y),
