@@ -157,6 +157,8 @@ static const int TWShallowDepth = 15;
 static const int TWShallowChildren = 20;
 static const NSUInteger TWWhyLength = 300; // characters of "why" at most
 static const NSTimeInterval TWFrontAXTimeout = 0.5; // seconds GET /wda/tw/front gives its accessibility lookup
+// (version 16, review RN-H2) the app in front the bounded way, for the fast tap's `apps` check (defined at the end)
+XCUIApplication *_Nullable TWBoundedFrontApplication(NSString *_Nullable __autoreleasing *_Nullable failure);
 // (version 16) the element at a point, the bounded way (TWHitCommands.m; where that file isn't built, WDA's own)
 #if !TARGET_OS_TV && !TARGET_OS_WATCH
 extern id<FBXCAccessibilityElement> _Nullable TWElementAtPoint(CGPoint point, NSString *_Nullable __autoreleasing *_Nullable how);
@@ -971,7 +973,7 @@ static NSArray<NSString *> *TWStringsIn(id _Nullable value)
  * looked up inside -[FBXCAXClientProxy withAXTimeout:do:error:] so that its accessibility calls wait `timeout`
  * seconds at most. nil, with `failure` set when the lookup raised, when it can't be told.
  */
-+ (nullable XCUIApplication *)frontApplicationFor:(FBRouteRequest *)request
++ (nullable XCUIApplication *)frontApplicationFor:(nullable FBRouteRequest *)request
                                            within:(NSTimeInterval)timeout
                                           failure:(NSString * _Nullable __autoreleasing *)failure
 {
@@ -1005,7 +1007,7 @@ static NSArray<NSString *> *TWStringsIn(id _Nullable value)
  * WDA's detection point; else the most recent; else the system application. WDA's own detection asks the daemon at
  * that point, a request nothing bounds (TWHitCommands.m). A session with another default application: WDA's own.
  */
-+ (XCUIApplication *)boundedActiveApplicationFor:(FBRouteRequest *)request
++ (XCUIApplication *)boundedActiveApplicationFor:(nullable FBRouteRequest *)request
 {
   FBSession *session = request.session;
   if (nil != session && ![session.defaultActiveApplication isEqualToString:@"auto"]) {
@@ -1360,3 +1362,15 @@ static NSArray<NSString *> *TWStringsIn(id _Nullable value)
 }
 
 @end
+
+/**
+ * (version 16, review RN-H2) The application in front, the bounded way, for a caller without a request (the fast
+ * tap's `apps` check, TWFastTapCommands.m): what GET /wda/tw/front finds, inside -withAXTimeout:do:error:
+ * (TWFrontAXTimeout), its point lookup the client's own (TWElementAtPoint). nil when it can't be told; `failure` set
+ * when the lookup raised.
+ */
+XCUIApplication *_Nullable TWBoundedFrontApplication(NSString *_Nullable __autoreleasing *_Nullable failure)
+{
+  return [TWTreeCommands frontApplicationFor:nil within:TWFrontAXTimeout failure:failure];
+}
+

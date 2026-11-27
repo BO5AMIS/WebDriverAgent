@@ -58,6 +58,8 @@
 + (NSString *)howFrom:(nullable id)value;
 + (NSString *)nothingWhyAfter:(NSNumber *)milliseconds how:(NSString *)how errorName:(nullable NSString *)errorName;
 + (nullable NSString *)shortErrorName:(nullable NSError *)error;
++ (NSString *)nothingWhyAfter:(NSNumber *)milliseconds all:(nullable NSNumber *)all how:(NSString *)how
+                    errorName:(nullable NSString *)errorName;
 + (nullable id)elementAt:(CGPoint)point how:(NSString * __autoreleasing *)how errorName:(NSString * __autoreleasing *)errorName;
 @end
 
@@ -161,6 +163,21 @@ static TWHitSnapshotDouble *TWSnapshot(id element)
   XCTAssertEqualObjects([TWHitCommands nothingWhyAfter:@12 how:@"daemon" errorName:nil], @"no element answered at the point (hit 12 ms, daemon)");
   XCTAssertEqualObjects([TWHitCommands nothingWhyAfter:@301 how:@"client" errorName:@"kAXErrorIPCTimeout"],
                         @"no element answered at the point (hit 301 ms, client, kAXErrorIPCTimeout)");
+}
+
+- (void)testNothingAnsweredSaysTheLookupsOwnTimeThenTheWhole
+{
+  // (review RN-M1) "hit" is the lookup alone, "all" the lookup with the AX timeout's lock, install and restore
+  XCTAssertEqualObjects([TWHitCommands nothingWhyAfter:@12 all:@272 how:@"client" errorName:nil],
+                        @"no element answered at the point (hit 12 ms, all 272 ms, client)");
+  XCTAssertEqualObjects([TWHitCommands nothingWhyAfter:@301 all:@318 how:@"client" errorName:@"kAXErrorIPCTimeout"],
+                        @"no element answered at the point (hit 301 ms, all 318 ms, client, kAXErrorIPCTimeout)");
+  // (review RN-M2) a client lookup that raised: the daemon way, the exception named after it
+  XCTAssertEqualObjects([TWHitCommands nothingWhyAfter:@300 all:@305 how:@"daemon"
+                                             errorName:@"NSInternalInconsistencyException"],
+                        @"no element answered at the point (hit 300 ms, all 305 ms, daemon, NSInternalInconsistencyException)");
+  XCTAssertEqualObjects([TWHitCommands nothingWhyAfter:@304 all:nil how:@"client" errorName:nil],
+                        @"no element answered at the point (hit 304 ms, client)");
 }
 
 - (void)testShortErrorNameIsTheAXErrorNameOrDomainAndCode

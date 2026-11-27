@@ -261,6 +261,28 @@ static NSNumber *FBXCTestOwnAXTimeout = nil;
   return element;
 }
 
+- (NSTimeInterval)tw_AXTimeout
+{
+  NSRecursiveLock *lock = FBAXTimeoutLock();
+  [lock lock];
+  @try {
+    return [FBAXClient AXTimeout];
+  } @finally {
+    [lock unlock];
+  }
+}
+
+- (BOOL)tw_setAXTimeout:(NSTimeInterval)timeout error:(NSError **)error
+{
+  NSRecursiveLock *lock = FBAXTimeoutLock();
+  [lock lock];
+  @try {
+    return [FBAXClient _setAXTimeout:timeout error:error];
+  } @finally {
+    [lock unlock];
+  }
+}
+
 - (XCUIApplication *)monitoredApplicationWithProcessIdentifier:(int)pid
 {
   @synchronized (self) {

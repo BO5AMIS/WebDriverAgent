@@ -8,7 +8,8 @@
  *               YES: answer once XCTest's daemon has synthesized it (the touch has been played).
  *   orientation the UIInterfaceOrientation the point is expressed in (default portrait, 1)
  *   apps        (version 4) bundle ids: the touch is made only while one of these apps is in front, as
- *               GET /wda/activeAppInfo (without a session) names it, asked just before the touch is queued.
+ *               GET /wda/tw/front names it (version 16; before it, as GET /wda/activeAppInfo without a session
+ *               did, whose point lookup nothing bounds), asked just before the touch is queued.
  *               Otherwise nothing is touched and the answer is an "invalid element state" error whose message
  *               starts "tapwright front:" and names the app in front ("unknown" when it can't be told), so the client
  *               can ask its own way. It is also refused that way while another touch is still being played (the
@@ -20,7 +21,7 @@
  *               before it lifts. Times are milliseconds from the press, in order, at most 60 s in all.
  *   orientation as for tap
  *   The answer comes once the whole drag has been played: {"ms": <synthesis ms>}.
- * GET /wda/tw/version -> {"tapwright": 16} (16: the point lookup of GET /wda/tw/hit and of the front route under an accessibility timeout, the phone's own time and way in its answers and refusals; 15: a widget's renderer is never the app in front; 12-14: the OCR of a turned screen: 14 reads it both ways up and keeps the better reading, and says `turn`; 1: tap only; 2: tap and drag; 3: and the photo routes of
+ * GET /wda/tw/version -> {"tapwright": 16} (16: the point lookup of GET /wda/tw/hit, of the front route and of the tap's `apps` check under an accessibility timeout, the phone's own time and way in its answers and refusals; 15: a widget's renderer is never the app in front; 12-14: the OCR of a turned screen: 14 reads it both ways up and keeps the better reading, and says `turn`; 1: tap only; 2: tap and drag; 3: and the photo routes of
  * TWPhotosCommands.m; 4: and the compact tree read of TWTreeCommands.m, and the tap's `apps`; 5: and the tree's
  * keyboard focus "f", and the hit test GET /wda/tw/hit of TWHitCommands.m; 6: hit snapshots bound to their
  * accessibility identity; 7: videos in the photo add of TWPhotosCommands.m; 8: /wda/locked read live from notifyd on every ask;
@@ -67,6 +68,9 @@ static const int TWMaxPending = 8; // touches queued and not yet played before n
 static const NSUInteger TWMaxDragPoints = 1000;
 
 static atomic_int twPending;
+
+// (version 16, review RN-H2) the app in front the bounded way (TWTreeCommands.m)
+XCUIApplication *_Nullable TWBoundedFrontApplication(NSString *_Nullable __autoreleasing *_Nullable failure);
 
 @interface TWFastTapCommands : NSObject <FBCommandHandler>
 @end
@@ -199,9 +203,12 @@ static atomic_int twPending;
 }
 
 /**
- * Why a touch for `apps` must not be made now, or nil when one of them is in front. The app in front is the one
- * GET /wda/activeAppInfo names when it is asked without a session, as Tapwright asks it (FBCustomCommands.m).
- * Anything that can't be told (an error, no bundle id) refuses: nothing is touched on doubt.
+ * Why a touch for `apps` must not be made now, or nil when one of them is in front. (Version 16, review RN-H2) The
+ * app in front is the one GET /wda/tw/front names, found inside the AX timeout with the client's own point lookup
+ * (TWBoundedFrontApplication). Before, it was XCUIApplication.fb_activeApplication, which, with more than one active
+ * application, asks XCTest's daemon at WDA's detection point: a request nothing bounds, which a busy app holds and every
+ * accessibility question after it waits behind (the phone, 2026-11-28). Anything that can't be told (an error, no
+ * bundle id) refuses: nothing is touched on doubt.
  */
 + (nullable NSString *)refusalFor:(NSArray<NSString *> *)apps
 {
@@ -210,7 +217,12 @@ static atomic_int twPending;
   }
   NSString *front = nil;
   @try {
-    front = XCUIApplication.fb_activeApplication.bundleID;
+    NSString *failure = nil;
+    front = TWBoundedFrontApplication(&failure).bundleID;
+    if (nil != failure) {
+      [FBLogger logFmt:@"Tapwright tap: the app in front can't be told: %@", failure];
+      front = nil;
+    }
   } @catch (NSException *e) {
     [FBLogger logFmt:@"Tapwright tap: the app in front can't be told: %@", e.reason];
     front = nil;

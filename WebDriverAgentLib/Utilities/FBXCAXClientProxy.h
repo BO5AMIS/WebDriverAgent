@@ -115,6 +115,11 @@ NS_ASSUME_NONNULL_BEGIN
  */
 - (nullable id<FBXCAccessibilityElement>)tw_elementAtPoint:(CGPoint)point error:(NSError **)error;
 
+/** (Tapwright, version 16) The accessibility client's AX timeout now, and a way to set it again: a restore that
+ *  -withAXTimeout:do:error: couldn't make is tried once more by the hit route (TWHitCommands.m). */
+- (NSTimeInterval)tw_AXTimeout;
+- (BOOL)tw_setAXTimeout:(NSTimeInterval)timeout error:(NSError **)error;
+
 /**
  Runs `block` synchronously with the XCTest automation-session XPC request timeout
  (the private `_XCTXPCRequestTimeout`/`_XCTSetXPCRequestTimeout` globals) temporarily
