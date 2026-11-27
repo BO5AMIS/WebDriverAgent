@@ -102,6 +102,20 @@ NS_ASSUME_NONNULL_BEGIN
 + (BOOL)setBaseAXTimeout:(NSTimeInterval)timeout error:(NSError **)error;
 
 /**
+ Tapwright (route version 16): does this XCTest have the client's own point lookup,
+ -[XCAXClient_iOS accessibilityElementForElementAtPoint:error:] (XCUIAccessibilityInterface)?
+ */
+- (BOOL)tw_canAskElementAtPoint;
+
+/**
+ Tapwright (route version 16): the accessibility element at a screen point, asked of the accessibility server by this
+ process (-[XCAXClient_iOS accessibilityElementForElementAtPoint:error:]), so that -withAXTimeout:do:error: bounds it,
+ unlike the daemon's _XCT_requestElementAtPoint:reply:, whose request nothing bounds. nil, with `error` set when the
+ lookup said why, when nothing answered or the selector isn't there (see -tw_canAskElementAtPoint).
+ */
+- (nullable id<FBXCAccessibilityElement>)tw_elementAtPoint:(CGPoint)point error:(NSError **)error;
+
+/**
  Runs `block` synchronously with the XCTest automation-session XPC request timeout
  (the private `_XCTXPCRequestTimeout`/`_XCTSetXPCRequestTimeout` globals) temporarily
  set to `timeout`, restoring the previous value once `block` returns (even if it

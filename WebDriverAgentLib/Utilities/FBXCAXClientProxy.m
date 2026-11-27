@@ -243,6 +243,24 @@ static NSNumber *FBXCTestOwnAXTimeout = nil;
                                     error:error];
 }
 
+- (BOOL)tw_canAskElementAtPoint
+{
+  return [FBAXClient respondsToSelector:@selector(accessibilityElementForElementAtPoint:error:)];
+}
+
+- (id<FBXCAccessibilityElement>)tw_elementAtPoint:(CGPoint)point error:(NSError **)error
+{
+  if (![self tw_canAskElementAtPoint]) {
+    return nil;
+  }
+  id told = nil;
+  id element = [FBAXClient accessibilityElementForElementAtPoint:point error:&told];
+  if (nil != error) {
+    *error = [told isKindOfClass:NSError.class] ? (NSError *)told : nil;
+  }
+  return element;
+}
+
 - (XCUIApplication *)monitoredApplicationWithProcessIdentifier:(int)pid
 {
   @synchronized (self) {

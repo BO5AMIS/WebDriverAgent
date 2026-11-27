@@ -54,6 +54,41 @@
 @interface TWHitCommands : NSObject
 + (BOOL)snapshot:(id)snapshot matchesHit:(id)hit;
 + (id)verifiedSnapshotOf:(id)hit inApplication:(id)application via:(NSString * __autoreleasing *)via;
+// route version 16: the way a point is asked, and what a lookup that found nothing says
++ (NSString *)howFrom:(nullable id)value;
++ (NSString *)nothingWhyAfter:(NSNumber *)milliseconds how:(NSString *)how errorName:(nullable NSString *)errorName;
++ (nullable NSString *)shortErrorName:(nullable NSError *)error;
++ (nullable id)elementAt:(CGPoint)point how:(NSString * __autoreleasing *)how errorName:(NSString * __autoreleasing *)errorName;
+@end
+
+
+// (version 16) the two lookups, faked: which was asked, what the client one says
+static NSUInteger TWClientAsks;
+static NSUInteger TWDaemonAsks;
+static BOOL TWClientCanAsk;
+static id TWClientElement;
+static NSString *TWClientErrorName;
+static id TWDaemonElement;
+@interface TWHitLookupDouble : TWHitCommands
+@end
+@implementation TWHitLookupDouble
++ (id)clientElementAt:(CGPoint)point asked:(BOOL *)asked errorName:(NSString * __autoreleasing *)errorName
+{
+  TWClientAsks++;
+  if (!TWClientCanAsk) {
+    return nil;
+  }
+  *asked = YES;
+  if (nil == TWClientElement && NULL != errorName) {
+    *errorName = TWClientErrorName;
+  }
+  return TWClientElement;
+}
++ (id)daemonElementAt:(CGPoint)point
+{
+  TWDaemonAsks++;
+  return TWDaemonElement;
+}
 @end
 
 @interface TWHitAXDouble : NSObject
@@ -118,6 +153,74 @@ static TWHitSnapshotDouble *TWSnapshot(id element)
 @end
 
 @implementation FBElementUtilitiesTests
+
+- (void)testNothingAnsweredSaysTheVersion6WordsFirstThenTheTimeAndTheWay
+{
+  // (version 16) daemons 2.0.2 and 2.0.3 match "no element answered"; 2.0.3 on runner 16 reads the time and the way
+  XCTAssertEqualObjects([TWHitCommands nothingWhyAfter:@304 how:@"client" errorName:nil], @"no element answered at the point (hit 304 ms, client)");
+  XCTAssertEqualObjects([TWHitCommands nothingWhyAfter:@12 how:@"daemon" errorName:nil], @"no element answered at the point (hit 12 ms, daemon)");
+  XCTAssertEqualObjects([TWHitCommands nothingWhyAfter:@301 how:@"client" errorName:@"kAXErrorIPCTimeout"],
+                        @"no element answered at the point (hit 301 ms, client, kAXErrorIPCTimeout)");
+}
+
+- (void)testShortErrorNameIsTheAXErrorNameOrDomainAndCode
+{
+  NSError *timedOut = [NSError errorWithDomain:@"XCTDaemonErrorDomain" code:13
+                                      userInfo:@{NSLocalizedDescriptionKey: @"Error kAXErrorIPCTimeout getting snapshot"}];
+  XCTAssertEqualObjects([TWHitCommands shortErrorName:timedOut], @"kAXErrorIPCTimeout");
+  NSError *other = [NSError errorWithDomain:@"SomeDomain" code:7 userInfo:@{NSLocalizedDescriptionKey: @"failed"}];
+  XCTAssertEqualObjects([TWHitCommands shortErrorName:other], @"SomeDomain 7");
+  XCTAssertNil([TWHitCommands shortErrorName:nil]);
+}
+
+- (void)testHowIsDaemonOnlyWhenAsked
+{
+  XCTAssertEqualObjects([TWHitCommands howFrom:@"daemon"], @"daemon");
+  XCTAssertEqualObjects([TWHitCommands howFrom:@"client"], @"client");
+  XCTAssertEqualObjects([TWHitCommands howFrom:nil], @"client");
+  XCTAssertEqualObjects([TWHitCommands howFrom:@"anything"], @"client");
+  XCTAssertEqualObjects([TWHitCommands howFrom:@42], @"client");
+}
+
+- (void)testTheClientWayIsAskedAndTheDaemonWayOnlyAsItsFallbackOrWhenAsked
+{
+  id element = TWAX(7, 42);
+  // the client's lookup answers: the daemon isn't asked
+  TWClientAsks = TWDaemonAsks = 0;
+  TWClientCanAsk = YES;
+  TWClientElement = element;
+  TWDaemonElement = nil;
+  NSString *how = @"client";
+  NSString *errorName = nil;
+  XCTAssertEqual([TWHitLookupDouble elementAt:CGPointZero how:&how errorName:&errorName], element);
+  XCTAssertEqualObjects(how, @"client");
+  XCTAssertEqual(TWDaemonAsks, 0u);
+  // the client's lookup asked and found nothing (the app didn't answer in time): no fallback, its error's name
+  TWClientAsks = TWDaemonAsks = 0;
+  TWClientElement = nil;
+  TWClientErrorName = @"kAXErrorIPCTimeout";
+  how = @"client";
+  XCTAssertNil([TWHitLookupDouble elementAt:CGPointZero how:&how errorName:&errorName]);
+  XCTAssertEqualObjects(how, @"client");
+  XCTAssertEqualObjects(errorName, @"kAXErrorIPCTimeout");
+  XCTAssertEqual(TWDaemonAsks, 0u);
+  // the client's lookup can't be made here: the daemon's, and the way says so
+  TWClientAsks = TWDaemonAsks = 0;
+  TWClientCanAsk = NO;
+  TWDaemonElement = element;
+  how = @"client";
+  XCTAssertEqual([TWHitLookupDouble elementAt:CGPointZero how:&how errorName:&errorName], element);
+  XCTAssertEqualObjects(how, @"daemon");
+  XCTAssertEqual(TWDaemonAsks, 1u);
+  // the daemon's way asked for (the lead's measurement): the client isn't asked
+  TWClientAsks = TWDaemonAsks = 0;
+  TWClientCanAsk = YES;
+  how = @"daemon";
+  XCTAssertEqual([TWHitLookupDouble elementAt:CGPointZero how:&how errorName:&errorName], element);
+  XCTAssertEqualObjects(how, @"daemon");
+  XCTAssertEqual(TWClientAsks, 0u);
+  XCTAssertEqual(TWDaemonAsks, 1u);
+}
 
 - (void)testHitSnapshotMustMatchElementAndProcessIdentity
 {

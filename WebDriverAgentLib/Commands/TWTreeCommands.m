@@ -109,7 +109,8 @@
  *
  * GET /wda/tw/version answers 4 from this version on, 5 once "f" is sent (see TWFastTapCommands.m), 9 once the tree
  * is bounded and the screen and OCR routes exist, 10 once `attrs`, `arraycap`, `modal`, `ms.request`, `ms.attrs` and
- * GET /wda/tw/attrs exist, 11 once GET /wda/tw/front, GET /wda/tw/shot and the OCR route's `image` exist.
+ * GET /wda/tw/attrs exist, 11 once GET /wda/tw/front, GET /wda/tw/shot and the OCR route's `image` exist, 16 once
+ * the front route's own point lookup is bounded (TWHitCommands.m).
  *
  * Kept in this one file so the fork rebases cleanly onto upstream.
  */
@@ -156,6 +157,18 @@ static const int TWShallowDepth = 15;
 static const int TWShallowChildren = 20;
 static const NSUInteger TWWhyLength = 300; // characters of "why" at most
 static const NSTimeInterval TWFrontAXTimeout = 0.5; // seconds GET /wda/tw/front gives its accessibility lookup
+// (version 16) the element at a point, the bounded way (TWHitCommands.m; where that file isn't built, WDA's own)
+#if !TARGET_OS_TV && !TARGET_OS_WATCH
+extern id<FBXCAccessibilityElement> _Nullable TWElementAtPoint(CGPoint point, NSString *_Nullable __autoreleasing *_Nullable how);
+#else
+static id<FBXCAccessibilityElement> _Nullable TWElementAtPoint(CGPoint point, NSString *_Nullable __autoreleasing *_Nullable how)
+{
+  if (NULL != how) {
+    *how = @"daemon";
+  }
+  return [FBActiveAppDetectionPoint axElementWithPoint:point];
+}
+#endif
 static NSString *const TWTierFull = @"full";
 static NSString *const TWTierShallow = @"shallow";
 static NSString *const TWTierRoot = @"root";
@@ -966,7 +979,7 @@ static NSArray<NSString *> *TWStringsIn(id _Nullable value)
   __block NSString *problem = nil;
   [[FBXCAXClientProxy sharedClient] withAXTimeout:timeout do:^{
     @try {
-      application = request.session.activeApplication ?: XCUIApplication.fb_activeApplication;
+      application = [self boundedActiveApplicationFor:request];
       // (version 15) WebDriverAgent names the app in front by the element at its detection point. On a home screen
       // page with an interactive widget at that point the element is the widget's, drawn by a WidgetRenderer process
       // (com.apple.chrono.WidgetRenderer-Default) whose accessibility never answers: the app in front was that
@@ -983,6 +996,33 @@ static NSArray<NSString *> *TWStringsIn(id _Nullable value)
     *failure = problem;
   }
   return application;
+}
+
+/**
+ * (version 16) The application in front as WebDriverAgent's own detection finds it for a session started without an
+ * app (Tapwright's: defaultActiveApplication "auto", or no session), with its one point lookup made the bounded way
+ * (TWElementAtPoint): the active applications; when there is more than one, the one whose process owns the element at
+ * WDA's detection point; else the most recent; else the system application. WDA's own detection asks the daemon at
+ * that point, a request nothing bounds (TWHitCommands.m). A session with another default application: WDA's own.
+ */
++ (XCUIApplication *)boundedActiveApplicationFor:(FBRouteRequest *)request
+{
+  FBSession *session = request.session;
+  if (nil != session && ![session.defaultActiveApplication isEqualToString:@"auto"]) {
+    return session.activeApplication;
+  }
+  NSArray<XCUIApplication *> *applications = XCUIApplication.fb_activeApplications;
+  if (applications.count > 1) {
+    id<FBXCAccessibilityElement> element = TWElementAtPoint(FBActiveAppDetectionPoint.sharedInstance.coordinates, NULL);
+    if (nil != element) {
+      for (XCUIApplication *application in applications) {
+        if (application.processID == element.processIdentifier) {
+          return application;
+        }
+      }
+    }
+  }
+  return applications.firstObject ?: XCUIApplication.fb_systemApplication;
 }
 
 /** Is this the bundle id of a process that only draws widgets (chronod's renderers)? Never an app in front. */
@@ -1006,7 +1046,8 @@ static NSArray<NSString *> *TWStringsIn(id _Nullable value)
       pid = application.processID;
       named = application.bundleID;
     } else {
-      id<FBXCAccessibilityElement> element = FBActiveAppDetectionPoint.sharedInstance.axElement;
+      // (version 16) the bounded lookup, not WDA's daemon question (TWHitCommands.m)
+      id<FBXCAccessibilityElement> element = TWElementAtPoint(FBActiveAppDetectionPoint.sharedInstance.coordinates, NULL);
       pid = nil == element ? 0 : element.processIdentifier;
       if (pid > 0) {
         XCUIApplication *app = [[FBXCAXClientProxy sharedClient] monitoredApplicationWithProcessIdentifier:pid];
@@ -1038,8 +1079,10 @@ static NSArray<NSString *> *TWStringsIn(id _Nullable value)
  *   alert: an element query of SpringBoard, not of the app in front, bounded by the AX timeout below.)
  * - That asks XCAXClient_iOS for the active applications: one request to the accessibility server for the list of
  *   application elements, not for anything inside an app, bounded by the AX timeout (TWFrontAXTimeout, 0.5 s) set
- *   with -withAXTimeout:do:error:. When there is more than one, it asks XCTest's daemon which element is at WDA's
- *   detection point (_XCT_requestElementAtPoint:, whose answer is waited for 0.3 s at most).
+ *   with -withAXTimeout:do:error:. When there is more than one, it asks which element is at WDA's detection point:
+ *   (version 16) the accessibility client's own lookup with the AX timeout at 0.3 s (TWElementAtPoint), where WDA's
+ *   detection asked XCTest's daemon (_XCT_requestElementAtPoint:, whose answer is waited for 0.3 s at most, the
+ *   request itself unbounded).
  * - The XCUIApplication comes from XCTest's process tracker (-monitoredApplicationWithProcessIdentifier:), and its
  *   processID and bundleID are properties of that tracker's process record: no accessibility request. Nothing here
  *   reads `identifier`, `label` or any other element attribute, which is what makes GET /wda/activeAppInfo wait.
